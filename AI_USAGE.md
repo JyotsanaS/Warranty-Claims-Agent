@@ -15,7 +15,7 @@
 - Claude Code helped expand components / flow quickly
 - Initial draft had too much complexity for prototype scope
 - Reduced complexity manually and kept only what matched PRD + realistic deliverable
-- Claude Code missed some important product/state details
+- Claude Code missed some important product/state details \n
 Missing pieces I had to add/think through:
 - how to track different claims made by a user
 - what claim info needs to be captured over the conversation
