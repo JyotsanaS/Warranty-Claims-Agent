@@ -1,0 +1,19 @@
+[project]
+name = "chargepoint"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "chonkie>=1.6.1",
+    "pinecone>=3.0.0",
+    "sentence-transformers>=3.0.0",
+    "python-dotenv>=1.0.0",
+    "streamlit>=1.35.0",
+    "httpx>=0.27.0",
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.29.0",
+    "pydantic-settings>=2.0.0",
+    "python-multipart>=0.0.9",
+    "litellm>=1.30.0",
+]

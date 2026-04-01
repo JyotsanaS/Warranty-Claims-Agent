@@ -1,4 +1,4 @@
-# 📑 Project: VoltEdge Hardware Warranty & Service Policies
+# VoltEdge Hardware Warranty & Service Policies
 
 ## 1. General Limited Warranty
 
