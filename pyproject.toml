@@ -16,4 +16,6 @@ dependencies = [
     "pydantic-settings>=2.0.0",
     "python-multipart>=0.0.9",
     "litellm>=1.30.0",
+    "langgraph>=0.2.0",
+    "langfuse>=4.0.4",
 ]

@@ -43,6 +43,7 @@ def init_session_state() -> None:
         "messages": [],
         "claim_status": None,
         "claim_decision_data": None,
+        "last_trace": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -123,6 +124,48 @@ def stream_message(session_id: str, text: str, image_bytes: bytes | None = None)
 # SSE → string generator adapter for st.write_stream()
 # ---------------------------------------------------------------------------
 
+_NODE_LABELS: dict[str, str] = {
+    "context_extractor":    "Extract context",
+    "claim_extractor":      "Extract claims",
+    "router":               "Classify intent",
+    "empathy_node":         "Generate empathy",
+    "policy_checker":       "RAG retrieval",
+    "evidence_planner":     "Plan evidence checks",
+    "vision_analysis":      "Analyse image",
+    "claim_validator":      "Validate claim",
+    "agent_respond":        "Generate response",
+    "claim_decision":       "Final decision",
+    "greeting_node":        "Greeting",
+    "fallback_node":        "Out-of-scope",
+    "escalation_node":      "Escalation",
+    "cancellation_node":    "Cancellation",
+    "status_node":          "Status query",
+    "confirmation_handler": "Confirm context switch",
+}
+
+
+def _node_detail(step: dict) -> str:
+    """Return a short human-readable detail string for a trace step."""
+    node = step.get("node", "")
+    if node == "router":
+        return f"intent={step.get('intent', '?')}  conf={step.get('confidence', 0):.0%}"
+    if node == "claim_extractor":
+        n = step.get("claims_found", 0)
+        return f"{n} claim{'s' if n != 1 else ''} found"
+    if node == "policy_checker":
+        n = step.get("chunks_retrieved", 0)
+        clauses = ", ".join(step.get("clauses", [])) or "—"
+        return f"{n} chunks · clauses: {clauses}"
+    if node == "empathy_node":
+        return f'prefix: "{step.get("prefix", "")}"'
+    if node == "vision_analysis":
+        return f"quality={step.get('image_quality', '?')}  conf={step.get('confidence', 0):.0%}"
+    if node == "claim_decision":
+        verdicts = step.get("verdicts", {})
+        return "  ".join(f"{k}={v}" for k, v in verdicts.items()) or "—"
+    return ""
+
+
 def _make_response_gen(event_stream, status_container):
     """
     Adapts the full SSE event stream into a string-only generator for
@@ -137,23 +180,51 @@ def _make_response_gen(event_stream, status_container):
         if etype == "text_delta":
             yield event["data"]["token"]
 
+        elif etype == "node_trace":
+            step = event["data"]
+            node = step.get("node", "unknown")
+            label = _NODE_LABELS.get(node, node)
+            duration = step.get("duration_ms", 0)
+            detail = _node_detail(step)
+            line = f"**{label}** `{duration} ms`"
+            if detail:
+                line += f" — {detail}"
+            status_container.write(line)
+
         elif etype == "tool_call":
-            tool = event["data"].get("tool", "unknown")
-            status_container.write(f"Running: **{tool}**...")
+            pass  # node_trace already covers this visually
 
         elif etype == "tool_result":
-            tool = event["data"].get("tool", "unknown")
-            status_container.write(f"Completed: **{tool}**")
+            pass  # node_trace already covers this visually
 
         elif etype == "claim_decision":
             st.session_state.claim_status = event["data"]["status"]
             st.session_state.claim_decision_data = event["data"]
 
+        elif etype == "done":
+            st.session_state.last_trace = event["data"].get("trace", [])
+
         elif etype == "error":
             status_container.update(label="Error", state="error")
             raise RuntimeError(event["data"].get("message", "Unknown error from agent."))
 
-        # "done" → generator exhausts naturally, no action needed
+
+def _render_trace(trace: list[dict]) -> None:
+    """Render a compact agent trace table inside an expander."""
+    if not trace:
+        return
+    total_ms = sum(s.get("duration_ms", 0) for s in trace)
+    with st.expander(f"Agent trace — {len(trace)} nodes · {total_ms} ms total"):
+        for i, step in enumerate(trace, 1):
+            node = step.get("node", "unknown")
+            label = _NODE_LABELS.get(node, node)
+            duration = step.get("duration_ms", 0)
+            elapsed = step.get("elapsed_ms", 0)
+            detail = _node_detail(step)
+            col1, col2, col3 = st.columns([3, 1, 1])
+            col1.markdown(f"**{i}. {label}**" + (f"  \n`{detail}`" if detail else ""))
+            col2.caption(f"{duration} ms")
+            col3.caption(f"+{elapsed} ms")
 
 
 # ---------------------------------------------------------------------------
@@ -333,3 +404,8 @@ if prompt:
         _render_claim_badge(st.session_state.claim_decision_data)
         # Keep data in state for the sidebar badge but mark as shown
         st.session_state.claim_decision_data = None
+
+    # Agent trace expander
+    if st.session_state.last_trace:
+        _render_trace(st.session_state.last_trace)
+        st.session_state.last_trace = None

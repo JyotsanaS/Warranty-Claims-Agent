@@ -42,8 +42,11 @@ async def create_session():
     session_id = str(uuid.uuid4())
     _sessions[session_id] = {
         "session_id": session_id,
-        "messages": [],          # conversation history: [{role, content}]
+        "messages": [],              # {role, content} dicts
         "claim_status": None,
+        "claim_items": [],           # persisted ClaimContext dicts
+        "user_claims": [],           # persisted UserClaim dicts
+        "active_claim_index": 0,
         "created_at": datetime.utcnow().isoformat(),
     }
     logger.info("Created session %s", session_id)
@@ -88,16 +91,20 @@ async def send_message(
 
     # ── Build SSE generator ───────────────────────────────────────────────────
     def _event_stream():
-        from agent.simple import stream_agent_response
+        from agent.runner import pop_final_state, stream_agent_response
 
         accumulated_tokens: list[str] = []
 
-        for chunk in stream_agent_response(
+        gen = stream_agent_response(
             session_id=session_id,
             messages=session["messages"],
             image_path=image_path,
-        ):
-            # Accumulate text tokens to save back to history
+            claim_items=session.get("claim_items", []),
+            user_claims=session.get("user_claims", []),
+            active_claim_index=session.get("active_claim_index", 0),
+        )
+
+        for chunk in gen:
             if chunk.startswith("data: "):
                 try:
                     evt = json.loads(chunk[6:].strip())
@@ -110,7 +117,16 @@ async def send_message(
                     pass
             yield chunk
 
-        # Save assistant response to conversation history
+        # ── Persist updated agent state back into session ─────────────────────
+        final = pop_final_state(session_id)
+        if final.get("claim_items") is not None:
+            session["claim_items"] = final["claim_items"]
+        if final.get("user_claims") is not None:
+            session["user_claims"] = final["user_claims"]
+        if final.get("active_claim_index") is not None:
+            session["active_claim_index"] = final["active_claim_index"]
+
+        # Save assistant reply to conversation history
         full_response = "".join(accumulated_tokens)
         if full_response:
             session["messages"].append({"role": "assistant", "content": full_response})
@@ -136,6 +152,8 @@ async def get_session(session_id: str):
         "session_id": session["session_id"],
         "message_count": len(session["messages"]),
         "claim_status": session.get("claim_status"),
+        "claim_items": session.get("claim_items", []),
+        "user_claims": session.get("user_claims", []),
         "created_at": session["created_at"],
     }
 

@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     image_upload_dir: str = "./data/images"
     image_max_size_mb: int = 10
 
+    # Langfuse
+    langfuse_secret_key: str = ""
+    langfuse_public_key: str = ""
+    langfuse_base_url: str = "https://us.cloud.langfuse.com"
+    langfuse_project_name: str = "warranty-agent"
+
     # App
     app_env: str = "development"
     log_level: str = "INFO"
