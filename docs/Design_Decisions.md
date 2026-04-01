@@ -2,30 +2,30 @@
 
 ## Chunking Strategy
 
-We adopted a section-aware, structure-preserving chunking approach tailored for policy documents. Instead of naïve fixed-size splitting, the pipeline:
+We use a section-aware, structure-preserving chunking approach designed for policy documents where formatting conveys meaning.
 
-- Splits documents by section headings (H2+), ensuring semantic boundaries are respected
-- Preserves tables as atomic units, avoiding row-level fragmentation
-- Applies recursive chunking within each section to maintain coherence
-- Introduces controlled overlap (≈10–20%) between chunks to reduce context loss
-- Avoids repeating section titles in the first chunk, while maintaining section context through metadata
+- Split on section headers (H2+) to maintain semantic boundaries
+- Treat tables as atomic units to prevent structural corruption
+- Apply recursive chunking within sections for coherent, size-bounded chunks
+- Add ~10–20% overlap to reduce boundary context loss
+- Store section context in metadata (not duplicated in text) This is useful if we need to retrieve more context later on or do some way of filtering.
 
-This design ensures that each chunk is contextually meaningful, retrieval-friendly, and structurally aligned with the original document.
+This ensures chunks are semantically complete, retrieval-friendly, and aligned with document structure, which is critical for reliable RAG performance.
 
 ## Embedding Model Selection
 
-For retrieval, we selected BGE-M3 as the primary embedding model.
+For retrieval, we selected BGE-M3 as embedding model.
 
-**Rationale:**
+Why:
 
-- Strong performance on MTEB benchmarks for retrieval tasks
-- Well-suited for structured and semi-structured text (e.g., sections, lists, tables)
-- Supports longer context windows (~8k tokens) while performing optimally on mid-sized chunks
-- Provides a good balance between performance, latency, and resource requirements
+- Strong MTEB retrieval performance
+- Handles structured + semi-structured content well
+- Supports long context (~8k tokens) while remaining efficient at our chunk sizes
+- Good balance of quality, latency, and infra cost
 
-We did not choose larger models such as Qwen3-Embedding due to current VRAM constraints. However, this remains a future option if higher recall or semantic fidelity is required.
+We avoided larger models (e.g., Qwen3 8B) due to VRAM constraints. We will revisit if recall proves insufficient.
 
-## Future Considerations
+### Future Considerations
 
 We will evaluate retrieval performance based on:
 
