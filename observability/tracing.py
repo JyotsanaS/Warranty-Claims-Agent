@@ -94,6 +94,10 @@ def setup_tracing() -> None:
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(_exporter))
     trace.set_tracer_provider(provider)
+
+    from openinference.instrumentation.litellm import LiteLLMInstrumentor
+    LiteLLMInstrumentor().instrument(tracer_provider=provider)
+
     _initialized = True
 
 

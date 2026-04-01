@@ -135,6 +135,10 @@ def fast_llm(
             )
             text = resp.choices[0].message.content or ""
             span.set_attribute("llm.response_length", len(text))
+            if resp.usage:
+                span.set_attribute("llm.tokens.prompt", resp.usage.prompt_tokens or 0)
+                span.set_attribute("llm.tokens.completion", resp.usage.completion_tokens or 0)
+                span.set_attribute("llm.tokens.total", resp.usage.total_tokens or 0)
             return text
         except Exception as exc:
             span.record_exception(exc)
@@ -167,6 +171,10 @@ def main_llm(
             )
             text = resp.choices[0].message.content or ""
             span.set_attribute("llm.response_length", len(text))
+            if resp.usage:
+                span.set_attribute("llm.tokens.prompt", resp.usage.prompt_tokens or 0)
+                span.set_attribute("llm.tokens.completion", resp.usage.completion_tokens or 0)
+                span.set_attribute("llm.tokens.total", resp.usage.total_tokens or 0)
             return text
         except Exception as exc:
             span.record_exception(exc)
@@ -207,6 +215,10 @@ def vision_llm(
             )
             text = resp.choices[0].message.content or ""
             span.set_attribute("llm.response_length", len(text))
+            if resp.usage:
+                span.set_attribute("llm.tokens.prompt", resp.usage.prompt_tokens or 0)
+                span.set_attribute("llm.tokens.completion", resp.usage.completion_tokens or 0)
+                span.set_attribute("llm.tokens.total", resp.usage.total_tokens or 0)
             if _should_log_payloads():
                 logger.info(
                     "vision_llm response model=%s body=%s",
