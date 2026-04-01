@@ -16,7 +16,10 @@ import logging
 import time
 import uuid
 
+from opentelemetry import trace as otel_trace
+
 from models.state import AgentState
+from observability.tracing import finish_session_trace, pop_serialized_trace, start_session_trace
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +38,8 @@ _RESPONSE_NODES = {
     "escalation_node",
     "cancellation_node",
     "confirmation_handler",
+    "post_resolution_close_node",
+    "feedback_node",
     "agent_respond",
     "claim_decision",
 }
@@ -65,7 +70,12 @@ def stream_agent_response(
     image_path: str | None = None,
     claim_items: list[dict] | None = None,
     user_claims: list[dict] | None = None,
+    pending_claim_draft: dict | None = None,
+    awaiting_post_resolution_followup: bool = False,
     active_claim_index: int = 0,
+    awaiting_first_user_turn: bool = False,
+    awaiting_feedback: bool = False,
+    user_feedback: str | None = None,
 ):
     """
     Generator yielding SSE-formatted strings.
@@ -77,7 +87,9 @@ def stream_agent_response(
     image_path         : absolute path to uploaded image, or None
     claim_items        : persisted ClaimContext list from previous turns
     user_claims        : persisted UserClaim list from previous turns
+    pending_claim_draft: extracted new-claim details awaiting confirmation
     active_claim_index : index of the currently active claim
+    awaiting_first_user_turn : whether this is the user's first reply after session start
     """
     from agent.graph import get_compiled_graph
 
@@ -96,80 +108,58 @@ def stream_agent_response(
         "claim_items": list(claim_items or []),
         "active_claim_index": active_claim_index,
         "user_claims": list(user_claims or []),
+        "pending_claim_draft": dict(pending_claim_draft) if pending_claim_draft else None,
+        "awaiting_post_resolution_followup": awaiting_post_resolution_followup,
+        "awaiting_feedback": awaiting_feedback,
+        "user_feedback": user_feedback,
+        "claim_state_updated_this_turn": False,
         "intent": "",
         "router_confidence": 0.0,
         "context_switch_detected": False,
         "pending_switch_confirmation": False,
+        "awaiting_first_user_turn": awaiting_first_user_turn,
+        "execution_plan": [],
+        "next_node": "",
+        "planner_reason": "",
         "token_count": 0,
     }
-
-    # ── Langfuse trace setup ──────────────────────────────────────────────────
-    from gateway.langfuse_client import get_langfuse, set_trace_context
-    lf = get_langfuse()
-    lf_trace = None
-    if lf is not None:
-        try:
-            from app.config import settings as _cfg
-            lf_trace = lf.trace(
-                id=initial_state["trace_id"],
-                name=f"{_cfg.langfuse_project_name}.agent_turn",
-                session_id=session_id,
-                tags=[_cfg.langfuse_project_name],
-                metadata={
-                    "image_attached": image_path is not None,
-                    "prior_claims": len(initial_state.get("user_claims", [])),
-                },
-            )
-            set_trace_context(initial_state["trace_id"])
-        except Exception:
-            logger.warning("Failed to create Langfuse trace", exc_info=True)
 
     claim_decision_data: dict | None = None
     final_state: dict = {}
     trace: list[dict] = []
     stream_start = time.perf_counter()
     node_start = stream_start
-
-    # ── Langfuse trace setup (v3+ API) ────────────────────────────────────────
-    import contextlib
-    from gateway.langfuse_client import get_langfuse, set_trace_context
-    lf = get_langfuse()
-
-    _lf_ctx = contextlib.nullcontext(None)
-    if lf is not None:
-        try:
-            from app.config import settings as _cfg
-            _lf_ctx = lf.start_as_current_observation(
-                as_type="trace",
-                name=f"{_cfg.langfuse_project_name}.agent_turn",
-                session_id=session_id,
-                tags=[_cfg.langfuse_project_name],
-                metadata={
-                    "image_attached": image_path is not None,
-                    "prior_claims": len(initial_state.get("user_claims", [])),
-                },
-            )
-        except Exception:
-            logger.warning("Failed to create Langfuse trace context", exc_info=True)
-
-    with _lf_ctx as lf_trace:
-        if lf_trace is not None:
+    openinference_trace: list[dict] = []
+    openinference_trace_id: str | None = None
+    session_span = None
+    try:
+        session_span = start_session_trace(session_id, initial_state["trace_id"])
+        openinference_trace_id = f"{session_span.get_span_context().trace_id:032x}"
+        graph_iter = iter(graph.stream(initial_state, stream_mode="updates"))
+        while True:
             try:
-                set_trace_context(lf_trace.trace_id)
-            except Exception:
-                pass
-
-        try:
-            for step in graph.stream(initial_state, stream_mode="updates"):
+                with otel_trace.use_span(session_span, end_on_exit=False):
+                    step = next(graph_iter)
+            except StopIteration:
+                break
             for node_name, updates in step.items():
                 logger.debug("Node completed: %s", node_name)
+                if updates is None:
+                    logger.warning("Node %s returned no state updates", node_name)
+                    updates = {}
+                elif not isinstance(updates, dict):
+                    logger.warning(
+                        "Node %s returned unexpected update type %s; ignoring payload",
+                        node_name,
+                        type(updates).__name__,
+                    )
+                    updates = {}
 
                 now = time.perf_counter()
                 duration_ms = round((now - node_start) * 1000)
                 elapsed_ms = round((now - stream_start) * 1000)
                 node_start = now
 
-                # ── Build per-node trace metadata ────────────────────────────
                 step_info: dict = {
                     "node": node_name,
                     "duration_ms": duration_ms,
@@ -178,8 +168,14 @@ def stream_agent_response(
                 if node_name == "router":
                     step_info["intent"] = updates.get("intent", "")
                     step_info["confidence"] = round(updates.get("router_confidence", 0.0), 2)
-                elif node_name == "claim_extractor":
-                    step_info["claims_found"] = len(updates.get("user_claims", []))
+                elif node_name == "claim_state_updater":
+                    step_info["claims_found"] = len(
+                        updates.get("user_claims", final_state.get("user_claims", []))
+                    )
+                elif node_name == "planner":
+                    step_info["next_node"] = updates.get("next_node", "")
+                    step_info["plan"] = updates.get("execution_plan", [])
+                    step_info["reason"] = updates.get("planner_reason", "")
                 elif node_name == "policy_checker":
                     step_info["chunks_retrieved"] = len(updates.get("policy_context", []))
                     step_info["clauses"] = updates.get("policy_clauses", [])
@@ -197,24 +193,6 @@ def stream_agent_response(
                 trace.append(step_info)
                 yield _sse("node_trace", step_info)
 
-                # ── Langfuse node span ───────────────────────────────────────
-                if lf_trace is not None:
-                    try:
-                        node_end_time = time.time()
-                        node_start_time = node_end_time - duration_ms / 1000
-                        import datetime
-                        span = lf_trace.span(
-                            name=node_name,
-                            start_time=datetime.datetime.fromtimestamp(node_start_time, tz=datetime.timezone.utc),
-                            end_time=datetime.datetime.fromtimestamp(node_end_time, tz=datetime.timezone.utc),
-                            metadata={k: v for k, v in step_info.items() if k != "node"},
-                        )
-                        span.end()
-                        set_trace_context(initial_state["trace_id"], span.id)
-                    except Exception:
-                        logger.debug("Failed to create Langfuse span for %s", node_name, exc_info=True)
-
-                # ── Tool-call events ─────────────────────────────────────────
                 if node_name in _TOOL_NODES:
                     tool_label = _TOOL_NODES[node_name]
                     yield _sse("tool_call", {"tool": tool_label, "status": "running"})
@@ -226,14 +204,12 @@ def stream_agent_response(
                         result_detail["result"] = updates.get("damage_report", {})
                     yield _sse("tool_result", result_detail)
 
-                # ── Text-delta events ────────────────────────────────────────
                 if node_name in _RESPONSE_NODES:
                     for msg in updates.get("messages", []):
                         if isinstance(msg, dict) and msg.get("role") == "assistant":
                             for token in _words(msg.get("content", "")):
                                 yield _sse("text_delta", {"token": token})
 
-                # ── Collect claim decision data (emitted after text) ──────────
                 if node_name == "claim_decision":
                     updated_claims = updates.get("user_claims", [])
                     verdicts = [c.get("claim_verdict") for c in updated_claims]
@@ -257,6 +233,11 @@ def stream_agent_response(
 
                 final_state.update(updates)
 
+        finish_session_trace(session_span)
+        openinference_trace = pop_serialized_trace(openinference_trace_id)
+        final_state["_openinference_trace_id"] = openinference_trace_id
+        final_state["_openinference_trace"] = openinference_trace
+
         if claim_decision_data:
             yield _sse("claim_decision", claim_decision_data)
 
@@ -264,19 +245,8 @@ def stream_agent_response(
         yield _sse("done", {"trace": trace, "total_ms": total_ms})
 
     except Exception as exc:
+        finish_session_trace(session_span)
         logger.exception("Agent graph error in session %s: %s", session_id, exc)
-        if lf_trace is not None:
-            try:
-                lf_trace.update(level="ERROR", status_message=str(exc))
-            except Exception:
-                pass
         yield _sse("error", {"message": str(exc)})
-
-    finally:
-        if lf is not None:
-            try:
-                lf.flush()
-            except Exception:
-                logger.debug("Langfuse flush failed", exc_info=True)
 
     _final_states[session_id] = final_state

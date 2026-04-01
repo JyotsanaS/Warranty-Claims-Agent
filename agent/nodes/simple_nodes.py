@@ -1,46 +1,49 @@
 """
 Simple agent nodes that require minimal or no LLM calls:
   greeting_node, fallback_node, status_node,
-  escalation_node, cancellation_node, confirmation_handler
+  escalation_node, cancellation_node, confirmation_handler, post_resolution_close_node
 """
 from __future__ import annotations
 
 import logging
 
 from gateway.llm_gateway import main_llm
+from agent.prompt_store import get_prompt
 from models.state import AgentState
 
 logger = logging.getLogger(__name__)
 
+_NEGATIVE_REPLY_MARKERS = {
+    "no",
+    "nope",
+    "nah",
+    "nothing",
+    "nothing else",
+    "no thanks",
+    "not now",
+}
 
-# ── Greeting ──────────────────────────────────────────────────────────────────
 
-_GREETING_SYSTEM = """\
-You are VoltEdge's warranty claims agent. The user is greeting you.
-Respond warmly and briefly. Let them know you can help with warranty claims,
-coverage questions, and claim status. Keep your reply to 2–3 sentences.
-"""
+def is_negative_reply(text: str) -> bool:
+    normalized = " ".join(str(text).strip().lower().split())
+    return normalized in _NEGATIVE_REPLY_MARKERS
 
 
 def greeting_node(state: AgentState) -> dict:
     last_user = next(
         (m["content"] for m in reversed(state["messages"]) if m["role"] == "user"), ""
     )
+    system_prompt = (
+        get_prompt("simple_nodes", "initial_greeting_system")
+        if state.get("awaiting_first_user_turn")
+        else get_prompt("simple_nodes", "standard_greeting_system")
+    )
     messages = [
-        {"role": "system", "content": _GREETING_SYSTEM},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": last_user},
     ]
     text = main_llm(messages)
     return {"messages": [{"role": "assistant", "content": text}]}
-
-
-# ── Fallback (out of scope) ────────────────────────────────────────────────────
-
-_FALLBACK_SYSTEM = """\
-You are VoltEdge's warranty claims agent. The user's message is outside your scope.
-Politely explain that you can only assist with warranty claims and coverage questions.
-Keep your reply to 2 sentences. Do not apologise excessively.
-"""
 
 
 def fallback_node(state: AgentState) -> dict:
@@ -48,7 +51,7 @@ def fallback_node(state: AgentState) -> dict:
         (m["content"] for m in reversed(state["messages"]) if m["role"] == "user"), ""
     )
     messages = [
-        {"role": "system", "content": _FALLBACK_SYSTEM},
+        {"role": "system", "content": get_prompt("simple_nodes", "fallback_system")},
         {"role": "user", "content": last_user},
     ]
     text = main_llm(messages)
@@ -125,22 +128,108 @@ def cancellation_node(state: AgentState) -> dict:
 def confirmation_handler_node(state: AgentState) -> dict:
     """
     Resolves a pending context switch.
-    For MVP: auto-approve the switch and start a new claim item.
     """
     claim_items: list[dict] = list(state.get("claim_items", []))
-    # Create a new empty claim slot — context_extractor will populate it next turn
-    from models.state import ClaimContext
-    new_ctx = ClaimContext()
-    claim_items.append(new_ctx.model_dump())
-    new_index = len(claim_items) - 1
+    pending_draft: dict | None = state.get("pending_claim_draft")
+    active = state.get("active_claim_index", 0)
+    last_user = next(
+        (m["content"] for m in reversed(state["messages"]) if m["role"] == "user"), ""
+    ).lower()
+
+    separate_markers = ("separate", "new claim", "another claim", "different claim")
+    same_markers = ("same", "same incident", "together", "one claim")
+
+    if any(token in last_user for token in separate_markers):
+        if pending_draft:
+            claim_items.append(dict(pending_draft))
+            new_index = len(claim_items) - 1
+        else:
+            new_index = active
+        text = (
+            "Understood. I'll treat that as a separate claim and continue with the new issue."
+        )
+        return {
+            "claim_items": claim_items,
+            "active_claim_index": new_index,
+            "pending_switch_confirmation": False,
+            "pending_claim_draft": None,
+            "messages": [{"role": "assistant", "content": text}],
+        }
+
+    if any(token in last_user for token in same_markers):
+        if pending_draft and claim_items and 0 <= active < len(claim_items):
+            ctx = dict(claim_items[active])
+            draft_component = pending_draft.get("component")
+            if draft_component and draft_component != ctx.get("component"):
+                ctx.setdefault("audit_notes", []).append(
+                    f"Additional related issue reported: {draft_component}"
+                )
+            for field in ("incident_type", "incident_date", "purchase_date"):
+                if pending_draft.get(field) and not ctx.get(field):
+                    ctx[field] = pending_draft[field]
+            if pending_draft.get("has_receipt"):
+                ctx["has_receipt"] = True
+            if pending_draft.get("has_image"):
+                ctx["has_image"] = True
+            claim_items[active] = ctx
+        text = (
+            "Understood. I'll keep this under the same claim and continue from the current case."
+        )
+        return {
+            "claim_items": claim_items,
+            "pending_switch_confirmation": False,
+            "pending_claim_draft": None,
+            "messages": [{"role": "assistant", "content": text}],
+        }
 
     text = (
-        "Got it — I'll start a new claim for the additional issue you mentioned. "
-        "Could you describe what's wrong with it?"
+        "Please confirm whether the additional issue should be handled as the same claim "
+        "or as a separate claim."
     )
     return {
-        "claim_items": claim_items,
-        "active_claim_index": new_index,
-        "pending_switch_confirmation": False,
+        "pending_switch_confirmation": True,
+        "pending_claim_draft": pending_draft,
+        "messages": [{"role": "assistant", "content": text}],
+    }
+
+
+def post_resolution_close_node(state: AgentState) -> dict:
+    text = (
+        "Thanks for reaching out to VoltEdge warranty support. "
+        "Before we close, please rate your experience:\n\n"
+        "**1.** 👍 Like\n"
+        "**2.** 👎 Dislike"
+    )
+    return {
+        "awaiting_post_resolution_followup": False,
+        "awaiting_feedback": True,
+        "messages": [{"role": "assistant", "content": text}],
+    }
+
+
+def feedback_node(state: AgentState) -> dict:
+    last_user = next(
+        (m["content"] for m in reversed(state["messages"]) if m["role"] == "user"), ""
+    ).strip()
+
+    normalized = last_user.lower()
+    if normalized in {"1", "like", "👍", "thumbs up", "good", "great"}:
+        feedback = "like"
+        text = "Thank you for the positive feedback! 😊 We're glad we could help. Have a great day!"
+    elif normalized in {"2", "dislike", "👎", "thumbs down", "bad", "poor"}:
+        feedback = "dislike"
+        text = "Thank you for your feedback. We're sorry the experience wasn't ideal — we'll use this to improve. Have a great day!"
+    else:
+        # Unrecognised response — ask again
+        text = (
+            "Sorry, I didn't catch that. Please reply with:\n\n"
+            "**1.** 👍 Like\n"
+            "**2.** 👎 Dislike"
+        )
+        return {"messages": [{"role": "assistant", "content": text}]}
+
+    return {
+        "awaiting_feedback": False,
+        "user_feedback": feedback,
         "messages": [{"role": "assistant", "content": text}],
     }

@@ -2,16 +2,19 @@
 LangGraph agent graph for VoltEdge warranty claims.
 
 Topology:
-  START → context_extractor → claim_extractor → router
-  router → (conditional) → one of:
-      confirmation_handler | greeting_node | fallback_node |
-      escalation_node | cancellation_node | status_node |
-      empathy_node → policy_checker |
-      policy_checker
-  policy_checker → (conditional) → evidence_planner → vision_analysis → claim_validator → agent_respond
-                                 → agent_respond
-  agent_respond → (conditional) → claim_decision → END
-                               → END
+  START → router
+  router → planner
+  planner → (conditional) → claim_state_updater | empathy_node | simple nodes |
+                            policy_checker | evidence_planner |
+                            vision_analysis | claim_validator | agent_respond |
+                            claim_decision | END
+  claim_state_updater → planner
+  empathy_node → planner
+  policy_checker → planner
+  evidence_planner → planner
+  vision_analysis → claim_validator → planner
+  agent_respond → END
+  claim_decision → END
 """
 from __future__ import annotations
 
@@ -22,11 +25,11 @@ from langgraph.graph import END, StateGraph
 
 from agent.nodes.agent_respond import agent_respond_node
 from agent.nodes.claim_decision import claim_decision_node
-from agent.nodes.claim_extractor import claim_extractor_node
+from agent.nodes.claim_state_updater import claim_state_updater_node
 from agent.nodes.claim_validator import claim_validator_node
-from agent.nodes.context_extractor import context_extractor_node
 from agent.nodes.empathy import empathy_node
 from agent.nodes.evidence_planner import evidence_planner_node
+from agent.nodes.planner import planner_node
 from agent.nodes.policy_checker import policy_checker_node
 from agent.nodes.router import router_node
 from agent.nodes.simple_nodes import (
@@ -34,65 +37,67 @@ from agent.nodes.simple_nodes import (
     confirmation_handler_node,
     escalation_node,
     fallback_node,
+    feedback_node,
     greeting_node,
+    post_resolution_close_node,
     status_node,
 )
 from agent.nodes.vision_analysis import vision_analysis_node
 from models.state import AgentState
+from observability.tracing import start_span
 
 logger = logging.getLogger(__name__)
+
+
+def _instrument_node(node_name: str, fn):
+    def _wrapped(state: AgentState):
+        attributes = {
+            "agent.node": node_name,
+            "session.id": state.get("session_id", ""),
+        }
+        with start_span(f"node.{node_name}", attributes=attributes) as span:
+            result = fn(state)
+            if isinstance(result, dict):
+                span.set_attribute("agent.node.output_keys", sorted(result.keys()))
+            return result
+
+    return _wrapped
 
 # ── Routing functions (conditional edges) ────────────────────────────────────
 
 
 def _route_from_router(state: AgentState) -> str:
-    if state.get("pending_switch_confirmation"):
-        return "confirmation_handler"
-
-    intent = state.get("intent", "issue")
-    return {
-        "greeting": "greeting_node",
-        "out_of_scope": "fallback_node",
-        "escalation": "escalation_node",
-        "cancellation": "cancellation_node",
-        "status_query": "status_node",
-        "frustration": "empathy_node",
-    }.get(intent, "policy_checker")
+    return "planner"
 
 
 def _route_from_empathy(state: AgentState) -> str:
-    """Skip policy_checker when there are no claims to process."""
-    user_claims: list[dict] = state.get("user_claims", [])
-    has_pending = any(c.get("policy_coverage") is None for c in user_claims)
-    return "policy_checker" if has_pending else "agent_respond"
+    return "planner"
 
 
-def _route_from_policy_checker(state: AgentState) -> str:
-    has_image = bool(state.get("image_local_path"))
-    if not has_image:
+def _route_from_planner(state: AgentState) -> str:
+    next_node = state.get("next_node") or "agent_respond"
+    valid_targets = {
+        "confirmation_handler",
+        "greeting_node",
+        "fallback_node",
+        "escalation_node",
+        "cancellation_node",
+        "status_node",
+        "post_resolution_close_node",
+        "feedback_node",
+        "empathy_node",
+        "claim_state_updater",
+        "policy_checker",
+        "evidence_planner",
+        "vision_analysis",
+        "claim_validator",
+        "agent_respond",
+        "claim_decision",
+        "END",
+    }
+    if next_node not in valid_targets:
         return "agent_respond"
-
-    user_claims: list[dict] = state.get("user_claims", [])
-    policy_valid = [
-        c for c in user_claims
-        if (c.get("policy_coverage") or {}).get("covered")
-        and c.get("visual_checks") is not None  # checks not yet planned
-    ]
-    if policy_valid or any(c.get("visual_checks") for c in user_claims):
-        return "evidence_planner"
-
-    return "agent_respond"
-
-
-def _route_from_agent_respond(state: AgentState) -> str:
-    """decision_gate: if all claims have a final verdict, emit claim_decision."""
-    user_claims: list[dict] = state.get("user_claims", [])
-    if not user_claims:
-        return END
-
-    final_verdicts = {"approved", "rejected", "escalated"}
-    all_resolved = all(c.get("claim_verdict") in final_verdicts for c in user_claims)
-    return "claim_decision" if all_resolved else END
+    return END if next_node == "END" else next_node
 
 
 # ── Graph builder ─────────────────────────────────────────────────────────────
@@ -102,42 +107,33 @@ def _build_graph() -> StateGraph:
     g = StateGraph(AgentState)
 
     # Register all nodes
-    g.add_node("context_extractor", context_extractor_node)
-    g.add_node("claim_extractor", claim_extractor_node)
-    g.add_node("router", router_node)
-    g.add_node("confirmation_handler", confirmation_handler_node)
-    g.add_node("greeting_node", greeting_node)
-    g.add_node("fallback_node", fallback_node)
-    g.add_node("escalation_node", escalation_node)
-    g.add_node("cancellation_node", cancellation_node)
-    g.add_node("status_node", status_node)
-    g.add_node("empathy_node", empathy_node)
-    g.add_node("policy_checker", policy_checker_node)
-    g.add_node("evidence_planner", evidence_planner_node)
-    g.add_node("vision_analysis", vision_analysis_node)
-    g.add_node("claim_validator", claim_validator_node)
-    g.add_node("agent_respond", agent_respond_node)
-    g.add_node("claim_decision", claim_decision_node)
+    g.add_node("router", _instrument_node("router", router_node))
+    g.add_node("claim_state_updater", _instrument_node("claim_state_updater", claim_state_updater_node))
+    g.add_node("confirmation_handler", _instrument_node("confirmation_handler", confirmation_handler_node))
+    g.add_node("greeting_node", _instrument_node("greeting_node", greeting_node))
+    g.add_node("fallback_node", _instrument_node("fallback_node", fallback_node))
+    g.add_node("escalation_node", _instrument_node("escalation_node", escalation_node))
+    g.add_node("cancellation_node", _instrument_node("cancellation_node", cancellation_node))
+    g.add_node("status_node", _instrument_node("status_node", status_node))
+    g.add_node("post_resolution_close_node", _instrument_node("post_resolution_close_node", post_resolution_close_node))
+    g.add_node("feedback_node", _instrument_node("feedback_node", feedback_node))
+    g.add_node("empathy_node", _instrument_node("empathy_node", empathy_node))
+    g.add_node("planner", _instrument_node("planner", planner_node))
+    g.add_node("policy_checker", _instrument_node("policy_checker", policy_checker_node))
+    g.add_node("evidence_planner", _instrument_node("evidence_planner", evidence_planner_node))
+    g.add_node("vision_analysis", _instrument_node("vision_analysis", vision_analysis_node))
+    g.add_node("claim_validator", _instrument_node("claim_validator", claim_validator_node))
+    g.add_node("agent_respond", _instrument_node("agent_respond", agent_respond_node))
+    g.add_node("claim_decision", _instrument_node("claim_decision", claim_decision_node))
 
     # Entry flow
-    g.set_entry_point("context_extractor")
-    g.add_edge("context_extractor", "claim_extractor")
-    g.add_edge("claim_extractor", "router")
+    g.set_entry_point("router")
 
-    # Router fan-out (conditional)
+    # Router always defers execution selection to planner.
     g.add_conditional_edges(
         "router",
         _route_from_router,
-        {
-            "confirmation_handler": "confirmation_handler",
-            "greeting_node": "greeting_node",
-            "fallback_node": "fallback_node",
-            "escalation_node": "escalation_node",
-            "cancellation_node": "cancellation_node",
-            "status_node": "status_node",
-            "empathy_node": "empathy_node",
-            "policy_checker": "policy_checker",
-        },
+        {"planner": "planner"},
     )
 
     # Terminal simple nodes
@@ -147,39 +143,48 @@ def _build_graph() -> StateGraph:
     g.add_edge("escalation_node", END)
     g.add_edge("cancellation_node", END)
     g.add_edge("status_node", END)
+    g.add_edge("post_resolution_close_node", END)
+    g.add_edge("feedback_node", END)
 
-    # Empathy → policy_checker only when there are unchecked claims, else skip to agent_respond
+    # Empathy always defers execution decisions to planner.
     g.add_conditional_edges(
         "empathy_node",
         _route_from_empathy,
-        {"policy_checker": "policy_checker", "agent_respond": "agent_respond"},
+        {"planner": "planner"},
     )
 
-    # Policy checker fan-out (conditional on image + coverage)
+    g.add_edge("claim_state_updater", "planner")
+
+    # Planner owns all post-router execution decisions.
     g.add_conditional_edges(
-        "policy_checker",
-        _route_from_policy_checker,
+        "planner",
+        _route_from_planner,
         {
+            "confirmation_handler": "confirmation_handler",
+            "greeting_node": "greeting_node",
+            "fallback_node": "fallback_node",
+            "escalation_node": "escalation_node",
+            "cancellation_node": "cancellation_node",
+            "status_node": "status_node",
+            "post_resolution_close_node": "post_resolution_close_node",
+            "feedback_node": "feedback_node",
+            "empathy_node": "empathy_node",
+            "claim_state_updater": "claim_state_updater",
+            "policy_checker": "policy_checker",
             "evidence_planner": "evidence_planner",
+            "vision_analysis": "vision_analysis",
+            "claim_validator": "claim_validator",
             "agent_respond": "agent_respond",
-        },
-    )
-
-    # Vision pipeline
-    g.add_edge("evidence_planner", "vision_analysis")
-    g.add_edge("vision_analysis", "claim_validator")
-    g.add_edge("claim_validator", "agent_respond")
-
-    # Decision gate (conditional after agent_respond)
-    g.add_conditional_edges(
-        "agent_respond",
-        _route_from_agent_respond,
-        {
             "claim_decision": "claim_decision",
             END: END,
         },
     )
 
+    g.add_edge("policy_checker", "planner")
+    g.add_edge("evidence_planner", "planner")
+    g.add_edge("vision_analysis", "claim_validator")
+    g.add_edge("claim_validator", "planner")
+    g.add_edge("agent_respond", END)
     g.add_edge("claim_decision", END)
 
     return g

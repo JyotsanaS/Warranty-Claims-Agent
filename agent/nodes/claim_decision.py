@@ -7,24 +7,10 @@ from __future__ import annotations
 import logging
 
 from gateway.llm_gateway import main_llm
+from agent.prompt_store import get_prompt
 from models.state import AgentState
 
 logger = logging.getLogger(__name__)
-
-_SYSTEM = """\
-You are VoltEdge's warranty claims agent issuing a final decision.
-
-You will be given the full claim assessment. Write a clear, empathetic final decision letter.
-
-Structure:
-1. Brief summary of each claim and its verdict (approved / rejected / escalated).
-2. For each approved claim: next steps (replacement / repair process).
-3. For each rejected claim: the specific policy clause that excludes it and why.
-4. Closing: reference number placeholder and next-steps contact.
-
-Tone: professional, empathetic, clear. Maximum 300 words.
-Always cite policy sections (e.g. §2, §3.1) when explaining decisions.
-"""
 
 
 def claim_decision_node(state: AgentState) -> dict:
@@ -49,16 +35,72 @@ def claim_decision_node(state: AgentState) -> dict:
     if policy_context:
         brief_lines.append("\nRelevant policy sections:\n" + "\n---\n".join(policy_context[:3]))
 
-    system_content = _SYSTEM + "\n\n" + "\n".join(brief_lines)
+    system_content = get_prompt("claim_decision") + "\n\n" + "\n".join(brief_lines)
 
     messages = [
         {"role": "system", "content": system_content},
-        {"role": "user", "content": "Please issue the final claim decision."},
+        {
+            "role": "user",
+            "content": (
+                "Please issue the final claim decision. "
+                f"Use case reference: VE-{state.get('session_id', 'UNKNOWN')[-8:].upper()}."
+            ),
+        },
     ]
 
     text = main_llm(messages, temperature=0.2)
     if not text:
-        text = "Your claim has been reviewed. Please contact support for the final decision."
+        text = "Your claim has been reviewed."
+
+    recorded_lines: list[str] = []
+    case_reference = f"VE-{state.get('session_id', 'UNKNOWN')[-8:].upper()}"
+    if len(user_claims) == 1:
+        claim = user_claims[0]
+        component = claim.get("component", "claim")
+        verdict = (claim.get("claim_verdict") or "pending").upper()
+        recorded_lines.append(
+            f"Final status: We are marking your {component} claim as {verdict} in our system."
+        )
+        recorded_lines.append("This status has been recorded for your case.")
+    elif user_claims:
+        recorded_lines.append("Final status: We have recorded the following claim outcomes in our system.")
+        for claim in user_claims:
+            component = claim.get("component", "claim")
+            verdict = (claim.get("claim_verdict") or "pending").upper()
+            recorded_lines.append(f"- {component}: {verdict}")
+
+    verdicts = [c.get("claim_verdict") for c in user_claims]
+    if all(v == "approved" for v in verdicts if v):
+        overall_status = "APPROVED"
+    elif any(v == "rejected" for v in verdicts):
+        overall_status = "REJECTED"
+    elif any(v == "escalated" for v in verdicts):
+        overall_status = "ESCALATED"
+    else:
+        overall_status = "PENDING"
+
+    footer_lines = [f"Case reference: {case_reference}"]
+    if overall_status == "APPROVED":
+        footer_lines.append("Next step: Our agent will contact you in the next 3 hours.")
+    elif overall_status == "REJECTED":
+        footer_lines.append("Next step: This claim has been closed as rejected in our system.")
+    elif overall_status == "ESCALATED":
+        footer_lines.append("Next step: This claim has been escalated for further review.")
+
+    footer_lines.extend(
+        [
+            "Please rate this resolution from 1 to 5:",
+            "1 - very poor resolution",
+            "2 - poor resolution",
+            "3 - fair resolution",
+            "4 - good resolution",
+            "5 - best resolution",
+        ]
+    )
+
+    if recorded_lines:
+        text = "\n".join(recorded_lines) + "\n\n" + text
+    text = text.rstrip() + "\n\n" + "\n".join(footer_lines)
 
     # Update claim_items status based on verdicts
     updated_claim_items = list(claim_items)
@@ -79,4 +121,5 @@ def claim_decision_node(state: AgentState) -> dict:
     return {
         "messages": [{"role": "assistant", "content": text}],
         "claim_items": updated_claim_items,
+        "user_claims": user_claims,
     }

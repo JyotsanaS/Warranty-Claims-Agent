@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     # Image storage
     image_upload_dir: str = "./data/images"
     image_max_size_mb: int = 10
+    results_dir: str = "./results"
 
     # Langfuse
     langfuse_secret_key: str = ""
@@ -41,6 +42,8 @@ class Settings(BaseSettings):
     app_env: str = "development"
     log_level: str = "INFO"
     max_tokens_per_session: int = 8000
+    log_http_bodies: bool = False
+    log_http_body_max_chars: int = 4000
 
 
 settings = Settings()

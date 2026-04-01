@@ -95,12 +95,25 @@ class AgentState(TypedDict):
     claim_items: list[dict]        # list of ClaimContext serialised as dicts
     active_claim_index: int
     user_claims: list[dict]        # list of UserClaim serialised as dicts
+    pending_claim_draft: Optional[dict]
+    awaiting_post_resolution_followup: bool
+    claim_state_updated_this_turn: bool
 
     # Router signals
     intent: str
     router_confidence: float
     context_switch_detected: bool
     pending_switch_confirmation: bool
+    awaiting_first_user_turn: bool
+
+    # Planner output
+    execution_plan: list[str]
+    next_node: str
+    planner_reason: str
+
+    # Feedback collection
+    awaiting_feedback: bool
+    user_feedback: Optional[str]     # "like" | "dislike" | None
 
     # Token budget
     token_count: int

@@ -5,42 +5,83 @@ No other module imports a provider SDK directly.
 from __future__ import annotations
 
 import logging
+import json
 from typing import Any
 
-import os
-
 import litellm
+
+from observability.tracing import start_span
 
 logger = logging.getLogger(__name__)
 litellm.suppress_debug_info = True
 
-# Enable Langfuse as a LiteLLM callback — captures prompts, responses, token counts.
-# No-ops gracefully if Langfuse is not configured.
-litellm.success_callback = ["langfuse"]
-litellm.failure_callback = ["langfuse"]
 
-# LiteLLM's Langfuse callback reads credentials from os.environ, not from the
-# pydantic Settings object.  Populate them here so tracing works.
-try:
-    from app.config import settings as _settings
-    if _settings.langfuse_secret_key:
-        os.environ.setdefault("LANGFUSE_SECRET_KEY", _settings.langfuse_secret_key)
-        os.environ.setdefault("LANGFUSE_PUBLIC_KEY", _settings.langfuse_public_key)
-        os.environ.setdefault("LANGFUSE_HOST", _settings.langfuse_base_url)
-except Exception:
-    pass
+def _truncate(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + f"... <truncated {len(value) - limit} chars>"
 
 
-def _langfuse_metadata(name: str) -> dict:
-    """Build the metadata dict that associates a LiteLLM call with the current Langfuse trace."""
-    from gateway.langfuse_client import get_trace_context
-    trace_id, span_id = get_trace_context()
-    if not trace_id:
-        return {}
-    meta: dict = {"trace_id": trace_id, "generation_name": name}
-    if span_id:
-        meta["parent_observation_id"] = span_id
-    return meta
+def _safe_dump(value: Any, limit: int) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=True, default=str)
+    except Exception:
+        text = str(value)
+    return _truncate(text, limit)
+
+
+def _summarize_messages(messages: list[dict], limit: int) -> str:
+    summary: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content")
+        if isinstance(content, list):
+            content_summary: list[dict[str, Any]] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    content_summary.append({"type": type(item).__name__})
+                    continue
+                item_type = item.get("type", "unknown")
+                if item_type == "text":
+                    content_summary.append(
+                        {
+                            "type": "text",
+                            "text": _truncate(str(item.get("text", "")), min(limit, 600)),
+                        }
+                    )
+                elif item_type == "image_url":
+                    url = ""
+                    image_url = item.get("image_url")
+                    if isinstance(image_url, dict):
+                        url = str(image_url.get("url", ""))
+                    content_summary.append(
+                        {
+                            "type": "image_url",
+                            "url_prefix": url[:80],
+                            "url_length": len(url),
+                        }
+                    )
+                else:
+                    content_summary.append({"type": item_type, "value": _safe_dump(item, 400)})
+            summary.append({"role": role, "content": content_summary})
+        else:
+            summary.append(
+                {
+                    "role": role,
+                    "content": _truncate(str(content or ""), min(limit, 1000)),
+                }
+            )
+    return _safe_dump(summary, limit)
+
+
+def _should_log_payloads() -> bool:
+    from app.config import settings
+    return settings.log_http_bodies
+
+
+def _payload_log_limit() -> int:
+    from app.config import settings
+    return settings.log_http_body_max_chars
 
 
 def _api_key() -> str:
@@ -73,20 +114,32 @@ def fast_llm(
     extra: dict[str, Any] = {}
     if json_mode:
         extra["response_format"] = {"type": "json_object"}
-    try:
-        resp = litellm.completion(
-            model=_fast_model(),
-            messages=messages,
-            temperature=temperature,
-            api_key=_api_key(),
-            metadata=_langfuse_metadata("fast_llm"),
-            **extra,
-            **kwargs,
-        )
-        return resp.choices[0].message.content or ""
-    except Exception as exc:
-        logger.error("fast_llm failed: %s", exc)
-        return ""
+    model = _fast_model()
+    with start_span(
+        "llm.fast",
+        {
+            "llm.model": model,
+            "llm.temperature": temperature,
+            "llm.json_mode": json_mode,
+            "llm.message_count": len(messages),
+        },
+    ) as span:
+        try:
+            resp = litellm.completion(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                api_key=_api_key(),
+                **extra,
+                **kwargs,
+            )
+            text = resp.choices[0].message.content or ""
+            span.set_attribute("llm.response_length", len(text))
+            return text
+        except Exception as exc:
+            span.record_exception(exc)
+            logger.error("fast_llm failed: %s", exc)
+            return ""
 
 
 def main_llm(
@@ -95,19 +148,30 @@ def main_llm(
     **kwargs: Any,
 ) -> str:
     """Call the main model (agent_respond, empathy, claim_decision). Returns text."""
-    try:
-        resp = litellm.completion(
-            model=_main_model(),
-            messages=messages,
-            temperature=temperature,
-            api_key=_api_key(),
-            metadata=_langfuse_metadata("main_llm"),
-            **kwargs,
-        )
-        return resp.choices[0].message.content or ""
-    except Exception as exc:
-        logger.error("main_llm failed: %s", exc)
-        return ""
+    model = _main_model()
+    with start_span(
+        "llm.main",
+        {
+            "llm.model": model,
+            "llm.temperature": temperature,
+            "llm.message_count": len(messages),
+        },
+    ) as span:
+        try:
+            resp = litellm.completion(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                api_key=_api_key(),
+                **kwargs,
+            )
+            text = resp.choices[0].message.content or ""
+            span.set_attribute("llm.response_length", len(text))
+            return text
+        except Exception as exc:
+            span.record_exception(exc)
+            logger.error("main_llm failed: %s", exc)
+            return ""
 
 
 def vision_llm(
@@ -116,19 +180,50 @@ def vision_llm(
     **kwargs: Any,
 ) -> str:
     """Call the vision model (vision_analysis only). Returns text."""
-    try:
-        resp = litellm.completion(
-            model=_vision_model(),
-            messages=messages,
-            temperature=temperature,
-            api_key=_api_key(),
-            metadata=_langfuse_metadata("vision_llm"),
-            **kwargs,
+    model = _vision_model()
+    if _should_log_payloads():
+        logger.info(
+            "vision_llm request model=%s temperature=%s kwargs=%s messages=%s",
+            model,
+            temperature,
+            _safe_dump(kwargs, _payload_log_limit()),
+            _summarize_messages(messages, _payload_log_limit()),
         )
-        return resp.choices[0].message.content or ""
-    except Exception as exc:
-        logger.error("vision_llm failed: %s", exc)
-        return ""
+    with start_span(
+        "llm.vision",
+        {
+            "llm.model": model,
+            "llm.temperature": temperature,
+            "llm.message_count": len(messages),
+        },
+    ) as span:
+        try:
+            resp = litellm.completion(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                api_key=_api_key(),
+                **kwargs,
+            )
+            text = resp.choices[0].message.content or ""
+            span.set_attribute("llm.response_length", len(text))
+            if _should_log_payloads():
+                logger.info(
+                    "vision_llm response model=%s body=%s",
+                    model,
+                    _truncate(text, _payload_log_limit()),
+                )
+            return text
+        except Exception as exc:
+            span.record_exception(exc)
+            if _should_log_payloads():
+                logger.error(
+                    "vision_llm provider error model=%s error=%s",
+                    model,
+                    repr(exc),
+                )
+            logger.error("vision_llm failed for model %s: %r", model, exc)
+            return ""
 
 
 def get_embeddings(texts: list[str]) -> list[list[float]]:

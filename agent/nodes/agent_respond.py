@@ -7,30 +7,30 @@ from __future__ import annotations
 import logging
 
 from gateway.llm_gateway import main_llm
+from agent.prompt_store import get_prompt
 from models.state import AgentState
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM = """\
-You are VoltEdge's warranty claims agent. Be concise, warm, and professional.
 
-Guidelines:
-- Write your response in plain, conversational language. Do NOT mention policy sections or clause
-  numbers inline in your response text.
-- If a claim has been assessed as covered, acknowledge it clearly and warmly.
-- If a claim is excluded, explain the reason in plain language without citing clauses inline.
-- If you need more information (purchase date, photo, receipt), ask for ONE piece at a time.
-- If an image was analysed, summarise what was found and how it affects the claim.
-- Never invent policy details that were not provided to you.
-- Keep your response under 200 words unless a detailed explanation is needed.
-- If policy sections were consulted and are relevant to the outcome, append them at the very end
-  under a separate heading exactly as shown:
+def _all_claims_rejected(user_claims: list[dict]) -> bool:
+    return bool(user_claims) and all(c.get("claim_verdict") == "rejected" for c in user_claims)
 
-CITATIONS:
-- §X Title
 
-  Only include this section when policy context was actually retrieved. Omit it entirely otherwise.
-"""
+def _build_rejection_followup(user_claims: list[dict]) -> str:
+    components = [str(c.get("component", "")).strip() for c in user_claims]
+    components = [c for c in components if c]
+    if not components:
+        subject = "this claim"
+    elif len(components) == 1:
+        subject = f"the claim for your {components[0]}"
+    else:
+        subject = "these claims"
+
+    return (
+        f"Sorry, we cannot accept {subject} for claim processing. "
+        "Can I do something else for you?"
+    )
 
 
 def agent_respond_node(state: AgentState) -> dict:
@@ -55,6 +55,13 @@ def agent_respond_node(state: AgentState) -> dict:
             )
         context_parts.append("Current claim assessment:\n" + "\n".join(claims_summary))
 
+    if _all_claims_rejected(user_claims) and not state.get("awaiting_post_resolution_followup"):
+        return {
+            "messages": [{"role": "assistant", "content": _build_rejection_followup(user_claims)}],
+            "empathy_prefix": "",
+            "awaiting_post_resolution_followup": True,
+        }
+
     damage_report = state.get("damage_report", {})
     if damage_report and damage_report.get("image_quality"):
         context_parts.append(
@@ -62,7 +69,7 @@ def agent_respond_node(state: AgentState) -> dict:
             f"confidence={damage_report.get('overall_confidence', 0):.0%}"
         )
 
-    system_content = _SYSTEM
+    system_content = get_prompt("agent_respond")
     if context_parts:
         system_content += "\n\n" + "\n\n".join(context_parts)
 
@@ -82,4 +89,5 @@ def agent_respond_node(state: AgentState) -> dict:
     return {
         "messages": [{"role": "assistant", "content": text}],
         "empathy_prefix": "",   # Clear after use
+        "awaiting_post_resolution_followup": _all_claims_rejected(user_claims),
     }

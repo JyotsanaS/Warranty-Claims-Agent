@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import logging
 
+from observability.tracing import start_span
+
 logger = logging.getLogger(__name__)
 
 # Lazy singletons — initialised on first retrieval call
@@ -46,31 +48,41 @@ def retrieve(query: str, top_k: int | None = None) -> list[dict]:
     if top_k is None:
         top_k = settings.rag_top_k
 
-    try:
-        model = _get_embed_model()
-        index = _get_index()
+    with start_span(
+        "rag.retrieve",
+        {
+            "rag.query": query,
+            "rag.top_k": top_k,
+            "rag.namespace": settings.pinecone_namespace,
+        },
+    ) as span:
+        try:
+            model = _get_embed_model()
+            index = _get_index()
 
-        embedding: list[float] = model.encode(query).tolist()
-        results = index.query(
-            vector=embedding,
-            top_k=top_k,
-            namespace=settings.pinecone_namespace,
-            include_metadata=True,
-        )
+            embedding: list[float] = model.encode(query).tolist()
+            results = index.query(
+                vector=embedding,
+                top_k=top_k,
+                namespace=settings.pinecone_namespace,
+                include_metadata=True,
+            )
 
-        chunks = []
-        for match in results.matches:
-            if match.score >= settings.rag_similarity_threshold:
-                chunks.append(
-                    {
-                        "text": match.metadata.get("text", ""),
-                        "section": match.metadata.get("section_title", ""),
-                        "score": round(match.score, 4),
-                    }
-                )
-        logger.debug("RAG: %d chunks above threshold for query %r", len(chunks), query[:60])
-        return chunks
+            chunks = []
+            for match in results.matches:
+                if match.score >= settings.rag_similarity_threshold:
+                    chunks.append(
+                        {
+                            "text": match.metadata.get("text", ""),
+                            "section": match.metadata.get("section_title", ""),
+                            "score": round(match.score, 4),
+                        }
+                    )
+            span.set_attribute("rag.results_count", len(chunks))
+            logger.debug("RAG: %d chunks above threshold for query %r", len(chunks), query[:60])
+            return chunks
 
-    except Exception as exc:
-        logger.warning("RAG retrieval failed: %s", exc)
-        return []
+        except Exception as exc:
+            span.record_exception(exc)
+            logger.warning("RAG retrieval failed: %s", exc)
+            return []

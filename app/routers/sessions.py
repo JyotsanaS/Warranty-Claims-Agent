@@ -6,8 +6,10 @@ Sessions are lost on server restart — acceptable for a prototype.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -17,6 +19,7 @@ from fastapi.responses import StreamingResponse
 
 from app.config import settings
 from storage.image_store import save_image
+from storage.session_store import save_session_json
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +27,12 @@ router = APIRouter()
 
 # In-memory store: session_id → session dict
 _sessions: dict[str, dict] = {}
-
+IDLE_TIMEOUT_SECONDS = 180
+INITIAL_ASSISTANT_MESSAGE = (
+    "Welcome to VoltEdge warranty support. I can help with warranty claims, "
+    "coverage questions, and claim status updates. Tell me what issue you're "
+    "facing, and I'll guide you from there."
+)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -32,6 +40,55 @@ def _require_session(session_id: str) -> dict:
     if session_id not in _sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     return _sessions[session_id]
+
+
+def _persist_session_artifacts(
+    session: dict,
+    image_path: str | None,
+    trace: list[dict],
+    total_ms: int | None,
+    openinference_trace_id: str | None,
+    openinference_trace: list[dict] | None,
+) -> None:
+    session_id = session["session_id"]
+
+    conversation_payload = {
+        "session_id": session_id,
+        "created_at": session.get("created_at"),
+        "updated_at": datetime.utcnow().isoformat(),
+        "claim_status": session.get("claim_status"),
+        "claim_items": session.get("claim_items", []),
+        "user_claims": session.get("user_claims", []),
+        "pending_claim_draft": session.get("pending_claim_draft"),
+        "awaiting_post_resolution_followup": session.get(
+            "awaiting_post_resolution_followup", False
+        ),
+        "active_claim_index": session.get("active_claim_index", 0),
+        "messages": session.get("messages", []),
+        "latest_image_path": image_path,
+        "latest_trace_total_ms": total_ms,
+        "latest_trace": trace,
+        "openinference_trace_id": openinference_trace_id,
+        "openinference_trace": openinference_trace or [],
+    }
+    save_session_json(session_id, "conversation.json", conversation_payload)
+
+
+
+# ── Idle eviction background loop ─────────────────────────────────────────────
+
+async def idle_eviction_loop() -> None:
+    """Evict sessions idle for longer than IDLE_TIMEOUT_SECONDS. Runs every 15 s."""
+    while True:
+        await asyncio.sleep(15)
+        now = time.time()
+        to_evict = [
+            sid for sid, sess in list(_sessions.items())
+            if now - sess.get("last_activity_at", now) > IDLE_TIMEOUT_SECONDS
+        ]
+        for sid in to_evict:
+            _sessions.pop(sid, None)
+            logger.info("Evicted idle session %s (idle > %ds)", sid, IDLE_TIMEOUT_SECONDS)
 
 
 # ── POST /sessions ─────────────────────────────────────────────────────────────
@@ -46,11 +103,18 @@ async def create_session():
         "claim_status": None,
         "claim_items": [],           # persisted ClaimContext dicts
         "user_claims": [],           # persisted UserClaim dicts
+        "pending_claim_draft": None,
+        "awaiting_post_resolution_followup": False,
         "active_claim_index": 0,
+        "awaiting_first_user_turn": True,
         "created_at": datetime.utcnow().isoformat(),
+        "last_activity_at": time.time(),
     }
     logger.info("Created session %s", session_id)
-    return {"session_id": session_id}
+    return {
+        "session_id": session_id,
+        "initial_assistant_message": INITIAL_ASSISTANT_MESSAGE,
+    }
 
 
 # ── POST /sessions/{session_id}/messages ──────────────────────────────────────
@@ -58,7 +122,7 @@ async def create_session():
 @router.post("/sessions/{session_id}/messages")
 async def send_message(
     session_id: str,
-    text: str = Form(...),
+    text: str = Form(""),
     image: Optional[UploadFile] = File(None),
 ):
     """
@@ -69,6 +133,7 @@ async def send_message(
       data: {"event": "<type>", "data": {...}}\n\n
     """
     session = _require_session(session_id)
+    session["last_activity_at"] = time.time()
 
     # ── Image validation & storage ────────────────────────────────────────────
     image_path: str | None = None
@@ -86,6 +151,10 @@ async def send_message(
         image_path = save_image(session_id, "upload", content, ext)
         logger.debug("Saved image for session %s → %s", session_id, image_path)
 
+    text = "" if text is None else str(text).strip()
+    if not text and not image_path:
+        raise HTTPException(status_code=400, detail="Message must include text or an image")
+
     # ── Append user message to history ────────────────────────────────────────
     session["messages"].append({"role": "user", "content": text})
 
@@ -94,6 +163,10 @@ async def send_message(
         from agent.runner import pop_final_state, stream_agent_response
 
         accumulated_tokens: list[str] = []
+        last_trace: list[dict] = []
+        last_trace_total_ms: int | None = None
+        openinference_trace_id: str | None = None
+        openinference_trace: list[dict] = []
 
         gen = stream_agent_response(
             session_id=session_id,
@@ -101,7 +174,12 @@ async def send_message(
             image_path=image_path,
             claim_items=session.get("claim_items", []),
             user_claims=session.get("user_claims", []),
+            pending_claim_draft=session.get("pending_claim_draft"),
+            awaiting_post_resolution_followup=session.get(
+                "awaiting_post_resolution_followup", False
+            ),
             active_claim_index=session.get("active_claim_index", 0),
+            awaiting_first_user_turn=session.get("awaiting_first_user_turn", False),
         )
 
         for chunk in gen:
@@ -113,6 +191,9 @@ async def send_message(
                         accumulated_tokens.append(evt["data"].get("token", ""))
                     elif etype == "claim_decision":
                         session["claim_status"] = evt["data"].get("status")
+                    elif etype == "done":
+                        last_trace = evt["data"].get("trace", [])
+                        last_trace_total_ms = evt["data"].get("total_ms")
                 except (json.JSONDecodeError, KeyError):
                     pass
             yield chunk
@@ -123,13 +204,33 @@ async def send_message(
             session["claim_items"] = final["claim_items"]
         if final.get("user_claims") is not None:
             session["user_claims"] = final["user_claims"]
+        if "pending_claim_draft" in final:
+            session["pending_claim_draft"] = final.get("pending_claim_draft")
+        if "awaiting_post_resolution_followup" in final:
+            session["awaiting_post_resolution_followup"] = final.get(
+                "awaiting_post_resolution_followup", False
+            )
         if final.get("active_claim_index") is not None:
             session["active_claim_index"] = final["active_claim_index"]
+        if final.get("_openinference_trace_id") is not None:
+            openinference_trace_id = final["_openinference_trace_id"]
+        if final.get("_openinference_trace") is not None:
+            openinference_trace = final["_openinference_trace"]
+        session["awaiting_first_user_turn"] = False
 
         # Save assistant reply to conversation history
         full_response = "".join(accumulated_tokens)
         if full_response:
             session["messages"].append({"role": "assistant", "content": full_response})
+
+        _persist_session_artifacts(
+            session,
+            image_path,
+            last_trace,
+            last_trace_total_ms,
+            openinference_trace_id,
+            openinference_trace,
+        )
 
     return StreamingResponse(
         _event_stream(),
@@ -154,6 +255,11 @@ async def get_session(session_id: str):
         "claim_status": session.get("claim_status"),
         "claim_items": session.get("claim_items", []),
         "user_claims": session.get("user_claims", []),
+        "pending_claim_draft": session.get("pending_claim_draft"),
+        "awaiting_post_resolution_followup": session.get(
+            "awaiting_post_resolution_followup", False
+        ),
+        "awaiting_first_user_turn": session.get("awaiting_first_user_turn", False),
         "created_at": session["created_at"],
     }
 

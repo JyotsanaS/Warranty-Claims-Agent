@@ -14,6 +14,11 @@ import streamlit as st
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 MOCK_BACKEND = os.getenv("MOCK_BACKEND", "0") == "1"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
+INITIAL_ASSISTANT_MESSAGE = (
+    "Welcome to VoltEdge warranty support. I can help with warranty claims, "
+    "coverage questions, and claim status updates. Tell me what issue you're "
+    "facing, and I'll guide you from there."
+)
 
 MOCK_SSE_EVENTS = [
     {"event": "tool_call", "data": {"tool": "rag", "status": "running"}},
@@ -40,10 +45,12 @@ MOCK_SSE_EVENTS = [
 def init_session_state() -> None:
     defaults = {
         "session_id": None,
+        "initial_assistant_message": "",
         "messages": [],
         "claim_status": None,
         "claim_decision_data": None,
         "last_trace": None,
+        "last_trace_total_ms": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -54,16 +61,25 @@ def init_session_state() -> None:
 # API client helpers
 # ---------------------------------------------------------------------------
 
-def create_session() -> str:
-    """POST /api/v1/sessions — returns session_id."""
+def create_session() -> dict:
+    """POST /api/v1/sessions — returns session metadata."""
     if MOCK_BACKEND:
         import uuid
-        return str(uuid.uuid4())
+        return {
+            "session_id": str(uuid.uuid4()),
+            "initial_assistant_message": INITIAL_ASSISTANT_MESSAGE,
+        }
 
     try:
         resp = httpx.post(f"{BACKEND_URL}/api/v1/sessions", timeout=10)
         resp.raise_for_status()
-        return resp.json()["session_id"]
+        data = resp.json()
+        return {
+            "session_id": data["session_id"],
+            "initial_assistant_message": data.get(
+                "initial_assistant_message", INITIAL_ASSISTANT_MESSAGE
+            ),
+        }
     except httpx.ConnectError:
         st.error(f"Cannot reach backend at {BACKEND_URL}. Is it running?")
         st.stop()
@@ -125,9 +141,9 @@ def stream_message(session_id: str, text: str, image_bytes: bytes | None = None)
 # ---------------------------------------------------------------------------
 
 _NODE_LABELS: dict[str, str] = {
-    "context_extractor":    "Extract context",
-    "claim_extractor":      "Extract claims",
     "router":               "Classify intent",
+    "claim_state_updater":  "Update claim state",
+    "planner":              "Plan execution",
     "empathy_node":         "Generate empathy",
     "policy_checker":       "RAG retrieval",
     "evidence_planner":     "Plan evidence checks",
@@ -141,6 +157,7 @@ _NODE_LABELS: dict[str, str] = {
     "cancellation_node":    "Cancellation",
     "status_node":          "Status query",
     "confirmation_handler": "Confirm context switch",
+    "feedback_node":        "Collect feedback",
 }
 
 
@@ -149,9 +166,14 @@ def _node_detail(step: dict) -> str:
     node = step.get("node", "")
     if node == "router":
         return f"intent={step.get('intent', '?')}  conf={step.get('confidence', 0):.0%}"
-    if node == "claim_extractor":
+    if node == "claim_state_updater":
         n = step.get("claims_found", 0)
         return f"{n} claim{'s' if n != 1 else ''} found"
+    if node == "planner":
+        next_node = step.get("next_node", "—") or "—"
+        plan = step.get("plan", [])
+        plan_summary = " -> ".join(plan[:3]) if plan else "—"
+        return f"next={next_node} · {plan_summary}"
     if node == "policy_checker":
         n = step.get("chunks_retrieved", 0)
         clauses = ", ".join(step.get("clauses", [])) or "—"
@@ -203,6 +225,7 @@ def _make_response_gen(event_stream, status_container):
 
         elif etype == "done":
             st.session_state.last_trace = event["data"].get("trace", [])
+            st.session_state.last_trace_total_ms = event["data"].get("total_ms")
 
         elif etype == "error":
             status_container.update(label="Error", state="error")
@@ -265,7 +288,10 @@ init_session_state()
 
 # Auto-create a session on first load so the user can chat immediately.
 if st.session_state.session_id is None:
-    st.session_state.session_id = create_session()
+    session_data = create_session()
+    st.session_state.session_id = session_data["session_id"]
+    st.session_state.initial_assistant_message = session_data["initial_assistant_message"]
+    st.session_state.messages = []
 
 # ---------------------------------------------------------------------------
 # ChatGPT-like styling
@@ -283,15 +309,15 @@ st.markdown("""
 [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"])
     [data-testid="stChatMessageContent"] {
     align-items: flex-end;
-    background: #2f2f2f;
-    border-radius: 18px 18px 4px 18px;
-    padding: 0.65rem 1rem;
+    background: transparent;
+    border-radius: 0;
+    padding: 0;
     max-width: 72%;
-    color: #ececec;
+    color: inherit;
 }
 [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"])
     [data-testid="stChatMessageContent"] p {
-    color: #ececec;
+    color: inherit;
     margin: 0;
 }
 
@@ -320,8 +346,9 @@ with st.sidebar:
     if st.button("New Session", type="primary", use_container_width=True):
         if st.session_state.session_id:
             delete_session(st.session_state.session_id)
-        new_id = create_session()
-        st.session_state.session_id = new_id
+        session_data = create_session()
+        st.session_state.session_id = session_data["session_id"]
+        st.session_state.initial_assistant_message = session_data["initial_assistant_message"]
         st.session_state.messages = []
         st.session_state.claim_status = None
         st.session_state.claim_decision_data = None
@@ -348,6 +375,10 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 st.header("Warranty Claims Chat")
 
+if st.session_state.initial_assistant_message:
+    with st.chat_message("assistant"):
+        st.markdown(st.session_state.initial_assistant_message)
+
 # Render existing conversation history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
@@ -365,7 +396,7 @@ prompt = st.chat_input(
 )
 
 if prompt:
-    text = prompt.text or ""
+    text = "" if prompt.text is None else str(prompt.text)
     files = prompt.files or []
     image_bytes: bytes | None = None
     if files:
@@ -392,7 +423,15 @@ if prompt:
         try:
             event_gen = stream_message(st.session_state.session_id, text, image_bytes)
             full_text = st.write_stream(_make_response_gen(event_gen, status_container))
-            status_container.update(label="Done", state="complete", expanded=False)
+            trace = st.session_state.last_trace or []
+            total_ms = st.session_state.last_trace_total_ms
+            if trace:
+                summary = f"Agent trace · {len(trace)} nodes"
+                if total_ms is not None:
+                    summary += f" · {total_ms} ms"
+                status_container.update(label=summary, state="complete", expanded=True)
+            else:
+                status_container.update(label="Complete", state="complete", expanded=True)
         except RuntimeError as e:
             st.error(str(e))
             full_text = ""
@@ -405,7 +444,6 @@ if prompt:
         # Keep data in state for the sidebar badge but mark as shown
         st.session_state.claim_decision_data = None
 
-    # Agent trace expander
-    if st.session_state.last_trace:
-        _render_trace(st.session_state.last_trace)
-        st.session_state.last_trace = None
+    # Clear per-turn trace state after the status container has rendered it.
+    st.session_state.last_trace = None
+    st.session_state.last_trace_total_ms = None

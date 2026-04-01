@@ -1,5 +1,6 @@
 """
-Router node — classifies intent of the latest user message.
+Router node — classifies the current user message using recent conversation
+and compact structured memory for context.
 Short-circuits to confirmation_handler if a context-switch is pending.
 """
 from __future__ import annotations
@@ -7,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 
+from agent.prompt_store import get_prompt
 from gateway.llm_gateway import fast_llm
 from models.state import AgentState
 
@@ -26,32 +28,70 @@ _INTENTS = (
     "clarification",  # answering a follow-up question
 )
 
-_SYSTEM = f"""\
-You are an intent-classification agent for a warranty claims chatbot.
-Classify the LAST user message into exactly one of these intents:
-{", ".join(_INTENTS)}
 
-Rules:
-- Use "escalation" only when the user explicitly asks for a human agent or is extremely upset.
-- Use "frustration" when the user expresses negative emotions, disappointment, dissatisfaction, or
-  frustration — even if no specific product problem is described. Sentiment-only messages belong here.
-  Examples: "I am disappointed in your service", "this is unacceptable", "very unhappy with you",
-  "terrible experience", "I'm fed up".
-- Use "issue" ONLY when the user describes a concrete product malfunction or physical problem.
-  Examples: "my charger won't turn on", "the display is cracked", "battery drains in an hour".
-  Do NOT use "issue" for messages that express feelings without describing a specific product defect.
-- Use "claim" when the user is initiating or submitting a warranty claim.
-- Use "out_of_scope" for anything unrelated to the product or warranty.
+def _build_recent_conversation(messages: list[dict], max_turns: int = 4) -> str:
+    recent = [m for m in messages if m.get("role") in ("user", "assistant")]
+    recent = recent[-(max_turns * 2):]
+    lines = [
+        f"{str(msg.get('role', '')).upper()}: {str(msg.get('content', '')).strip()}"
+        for msg in recent
+        if str(msg.get("content", "")).strip()
+    ]
+    return "\n".join(lines) if lines else "None"
 
-Return JSON only:
-{{"intent": "<intent>", "confidence": <0.0-1.0>, "requires_policy_lookup": <true|false>, "requires_vision": <true|false>}}
 
-"requires_policy_lookup" = true when the response needs to reference policy sections.
-"requires_vision" = true when the user mentions sending or has already sent a photo.
-"""
+def _build_structured_memory(state: AgentState, max_claims: int = 3) -> str:
+    memory_lines: list[str] = []
+    claim_items: list[dict] = list(state.get("claim_items", []))
+    active_index = state.get("active_claim_index", 0)
+
+    if claim_items and 0 <= active_index < len(claim_items):
+        active = claim_items[active_index]
+        memory_lines.append("Active claim:")
+        memory_lines.append(
+            f"- component={active.get('component') or 'unknown'}; "
+            f"incident_type={active.get('incident_type') or 'unknown'}; "
+            f"status={active.get('claim_status') or 'open'}; "
+            f"has_image={bool(active.get('has_image'))}; "
+            f"has_receipt={bool(active.get('has_receipt'))}"
+        )
+    else:
+        memory_lines.append("Active claim: none")
+
+    memory_lines.append(
+        f"Pending context switch confirmation: {bool(state.get('pending_switch_confirmation'))}"
+    )
+
+    user_claims: list[dict] = list(state.get("user_claims", []))
+    if user_claims:
+        memory_lines.append("Known user claims:")
+        for claim in user_claims[:max_claims]:
+            coverage = claim.get("policy_coverage") or {}
+            covered = (
+                coverage.get("covered")
+                if claim.get("policy_coverage") is not None
+                else "unknown"
+            )
+            memory_lines.append(
+                f"- component={claim.get('component') or 'unknown'}; "
+                f"type={claim.get('assertion_type') or 'unknown'}; "
+                f"verdict={claim.get('claim_verdict') or 'unresolved'}; "
+                f"covered={covered}"
+            )
+    else:
+        memory_lines.append("Known user claims: none")
+
+    return "\n".join(memory_lines)
 
 
 def router_node(state: AgentState) -> dict:
+    # If awaiting feedback, bypass LLM classification
+    if state.get("awaiting_feedback"):
+        return {
+            "intent": "feedback_response",
+            "router_confidence": 1.0,
+        }
+
     # If a context switch is already pending, bypass LLM classification
     if state.get("pending_switch_confirmation"):
         return {
@@ -59,15 +99,22 @@ def router_node(state: AgentState) -> dict:
             "router_confidence": 1.0,
         }
 
-    # Build conversation snippet for classification (last 6 messages max)
-    history = state["messages"][-6:]
-    last_user = next(
-        (m["content"] for m in reversed(history) if m["role"] == "user"), ""
+    history = state["messages"]
+    last_user = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+    recent_conversation = _build_recent_conversation(history, max_turns=4)
+    structured_memory = _build_structured_memory(state)
+    user_content = (
+        f"Recent conversation:\n{recent_conversation}\n\n"
+        f"Structured memory:\n{structured_memory}\n\n"
+        f"Current user message to classify:\n{last_user}"
     )
 
     messages = [
-        {"role": "system", "content": _SYSTEM},
-        {"role": "user", "content": last_user},
+        {
+            "role": "system",
+            "content": get_prompt("router").format(intents=", ".join(_INTENTS)),
+        },
+        {"role": "user", "content": user_content},
     ]
 
     raw = fast_llm(messages, json_mode=True)

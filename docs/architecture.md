@@ -342,7 +342,7 @@ litellm.success_callback = [track_usage]
 litellm.set_verbose = False
 
 # ── Text generation clients ───────────────────────────────────────────────────
-# Used by: router, context_extractor, claim_extractor,
+# Used by: router, claim_state_updater,
 #          query_reformulator, evidence_planner
 fast_llm = ChatLiteLLM(
     model=settings.LLM_FAST_MODEL,       # "groq/llama-3.1-8b-instant"
@@ -406,9 +406,8 @@ def _get_local_embeddings(texts: list[str], model_name: str) -> list[list[float]
 
 | Node | Gateway client | Reason |
 |---|---|---|
-| `router` | `fast_llm` | Simple classification, ~200ms, 14,400 RPD quota |
-| `context_extractor` | `fast_llm` | Structured field extraction, lightweight |
-| `claim_extractor` | `fast_llm` | Structured extraction from conversation |
+| `router` | `fast_llm` | First-pass turn classification, cost gate, ~200ms |
+| `claim_state_updater` | `fast_llm` | Merges claim memory + normalized claim assertions for claim-relevant turns |
 | `query_reformulator` (inside `policy_checker`) | `fast_llm` | Generates 2–3 short query strings |
 | `evidence_planner` | `fast_llm` | Generates targeted `VisualCheck` descriptions |
 | `empathy_node` | `main_llm` | Tone-aware generation needs stronger reasoning |
@@ -601,8 +600,9 @@ class AgentState(TypedDict):
     # Multi-claim working memory (see §3.X)
     claim_items: list[ClaimContext]  # all claim items opened this session
     active_claim_index: int          # index into claim_items currently being worked
-    context_switch_detected: bool    # context_extractor flagged a topic change
+    context_switch_detected: bool    # claim_state_updater flagged a topic change
     pending_switch_confirmation: bool # agent is waiting for user to confirm switch
+    pending_claim_draft: ClaimContext | None  # preserves extracted new-claim details during switch confirmation
 
     # Session-level decision summary
     policy_clauses: list[str]       # e.g. ["§2 Component Coverage", "§3.2 Env Abuse"]
@@ -626,8 +626,10 @@ re-derive the same facts from the full message history on every turn, which is e
 in tokens and fragile.
 
 `ClaimContext` is the agent's structured working memory for a single claim item. It is
-**incrementally extracted and merged** by the `context_extractor` node after each user
-turn, before the router runs.
+**incrementally extracted and merged** by the `claim_state_updater` node after routing
+has already established that the current turn is actually claim-relevant. This avoids
+mutating claim state for greetings, policy-only questions, cancellations, and other
+administrative turns.
 
 #### ClaimContext Model
 
@@ -672,9 +674,16 @@ class ClaimContext(BaseModel):
 
 #### Field Merge Rules
 
-The `context_extractor` applies these rules when merging new information into an existing
-`ClaimContext`. The extractor never receives the full history — only the **latest user
-message** and the **current ClaimContext** to merge against.
+The `claim_state_updater` applies these rules when merging new information into an
+existing `ClaimContext`. The updater receives:
+
+- the latest user message
+- the current active `ClaimContext`
+- a small recent window of claim-relevant turns
+- image / attachment metadata for the current turn
+
+It does not need the full transcript on every turn, because claim memory already stores
+the structured facts that matter operationally.
 
 | Scenario | Rule |
 |---|---|
@@ -689,7 +698,7 @@ One session can hold **multiple independent `ClaimContext` items** in `state.cla
 Each has its own evidence checklist and decision outcome. The `active_claim_index` pointer
 tracks which one is currently being worked.
 
-When `context_extractor` detects a new component or a different incident type in the
+When `claim_state_updater` detects a new component or a different incident type in the
 user's message, it evaluates:
 
 ```python
@@ -713,7 +722,7 @@ def should_confirm_switch(claim: ClaimContext) -> bool:
 User: "Also my cable stopped charging"
         │
         ▼
-[context_extractor]
+[claim_state_updater]
   detects: new component mentioned, different from active claim
         │
    should_confirm_switch(active_claim)?
@@ -728,12 +737,13 @@ User: "Also my cable stopped charging"
         │        (B) Treat both as part of the same incident?"
         │
         │     User: "separate"
-        │       → new ClaimContext appended to claim_items
+        │       → extracted new-claim details stored in state.pending_claim_draft
+        │       → if user confirms "separate", pending_claim_draft appended to claim_items
         │       → active_claim_index updated to new item
         │       → pending_switch_confirmation = False
         │
         │     User: "same incident"
-        │       → components merged into active ClaimContext
+        │       → pending_claim_draft merged into active ClaimContext
         │       → pending_switch_confirmation = False
         │
         └── NO  (evidence already submitted OR claim brand new)
@@ -744,9 +754,9 @@ User: "Also my cable stopped charging"
 
 **Temporary detour (policy question mid-claim):**
 If the router classifies a turn as `policy_inquiry` while a claim is in progress,
-`context_switch_detected` is NOT set. The agent answers the policy question and the active
-`ClaimContext` is preserved untouched. No confirmation required — the user is just asking
-a question, not abandoning their claim.
+`claim_state_updater` is skipped entirely unless the policy question explicitly advances
+claim evidence. The active `ClaimContext` is preserved untouched. No confirmation is
+required — the user is just asking a question, not abandoning their claim.
 
 #### Data Retention Policy for Claim Items
 
@@ -783,6 +793,8 @@ before any expensive operation (RAG, vision, main LLM) is invoked.
 - Every turn has a logged `intent` field — enables product analytics ("what % of users
   open with a direct claim vs. a question?")
 - Routing logic is a pure, testable function — not buried in a system prompt
+- Claim state is mutated only for turns that actually progress a claim, reducing false
+  claim creation and stale state accumulation
 
 ---
 
@@ -811,6 +823,62 @@ fields from `state.claim_items[state.active_claim_index]` to determine what to a
 **Special case:** If `state.pending_switch_confirmation is True`, the router short-circuits
 to `confirmation_handler` regardless of the classified intent — the agent must resolve the
 pending context switch before processing any new claim work.
+
+#### Why Router Comes First
+
+The router is intentionally the first interpretation step. From a behavioural standpoint,
+this prevents the system from doing claim extraction on turns like:
+
+- "hi"
+- "what's my claim status?"
+- "cancel this"
+- "is water damage covered?"
+- "this is unacceptable"
+
+If extraction runs before routing, those turns can accidentally mutate claim memory,
+append stale `UserClaim` entries, or force policy questions through a claim-shaped path.
+Putting the router first turns it into a cost gate and a state-integrity gate.
+
+---
+
+### 3.4A Claim State Updater Node
+
+`claim_state_updater` replaces the older `context_extractor` + `claim_extractor` split.
+It runs only for claim-progressing intents:
+
+- `claim_initiation`
+- `issue_description`
+- `evidence_submission`
+- `clarification_response`
+
+It does **two jobs in one pass**:
+
+1. Updates structured working memory for the active claim (`ClaimContext`)
+2. Produces normalized `UserClaim` assertions for downstream policy and vision reasoning
+
+This merge is intentional. In practice, the old split caused overlapping interpretation
+logic, extra latency, and state mutation before the system understood what kind of turn it
+was handling.
+
+**Inputs**
+
+- latest user message
+- active `ClaimContext` (if any)
+- small recent window of claim-relevant history
+- current-turn attachment metadata
+
+**Outputs**
+
+- updated `claim_items`
+- updated `active_claim_index`
+- updated `user_claims`
+- `context_switch_detected`
+- `pending_switch_confirmation`
+- `pending_claim_draft` when a new claim has been detected but not yet confirmed
+
+**Design principle:** extract only what changes behaviour downstream. The updater should
+not be a generic transcript summariser. It should return stable, mergeable fields that
+directly affect routing, RAG, evidence collection, and decisioning.
 
 ---
 
@@ -858,24 +926,12 @@ seamless, empathetic reply — never two separate messages.
 START
   │
   ▼
-[context_extractor]      ← lightweight LLM (llama-3.1-8b-instant), runs every turn
-  • extracts structured updates from latest user message
-  • merges into claim_items[active_claim_index]
-  • detects context switch → sets context_switch_detected / pending_switch_confirmation
-  │
-  ▼
-[claim_extractor]        ← NEW — lightweight LLM (llama-3.1-8b-instant), runs every turn
-  • extracts / updates UserClaim objects from full conversation
-  • merges new claims into state.user_claims (additive, preserves existing)
-  • each claim carries: component, assertion, verbatim user statement
-  │
-  ▼
 [router]  ← llama-3.1-8b-instant, structured output, ~200ms
-  now has ClaimContext AND user_claims to inform routing
+  first-pass turn classification
   │
   ├── pending_switch_confirmation is True (any intent)
   │         └──► [confirmation_handler]
-  │               resolves claim_items / active_claim_index
+  │               resolves claim_items / active_claim_index / pending_claim_draft
   │               clears pending_switch_confirmation ──────────────────────► END
   │
   ├── greeting ────────────────────────────────────► [greeting_node] ────────► END
@@ -888,9 +944,21 @@ START
   │                                                          │
   │                                                  [empathy_router] (§3.5)
   │
-  └── policy_inquiry / claim_initiation /
-      issue_description / evidence_submission /
-      clarification_response
+  ├── policy_inquiry ───────────────────────────────► [policy_checker]
+  │                                                    inquiry mode:
+  │                                                    • query built from user question
+  │                                                    • active ClaimContext used only as optional disambiguation
+  │                                                    • does not mutate claim_items
+  │
+  └── claim_initiation / issue_description /
+      evidence_submission / clarification_response
+              │
+              ▼
+      [claim_state_updater]  ← lightweight LLM (llama-3.1-8b-instant), claim turns only
+        • merges latest structured claim facts into active ClaimContext
+        • updates / normalizes UserClaim assertions for downstream reasoning
+        • detects context switch without discarding extracted new-claim details
+        • writes pending_claim_draft when waiting for user confirmation
               │
               ▼
       [policy_checker]   ← RAG per UserClaim → PolicyCoverage per claim
@@ -1027,7 +1095,7 @@ environment variables so they can be swapped without code changes.
 
 | Node | Model | Env var | Reason |
 |---|---|---|---|
-| Router, context_extractor, query_reformulator | `llama-3.1-8b-instant` | `GROQ_FAST_MODEL` | 560 t/s, 14,400 RPD quota, tool calling, ~200ms latency |
+| Router, claim_state_updater, query_reformulator | `llama-3.1-8b-instant` | `GROQ_FAST_MODEL` | 560 t/s, 14,400 RPD quota, tool calling, ~200ms latency |
 | agent_respond, empathy_node, claim_decision | `llama-3.3-70b-versatile` | `GROQ_MAIN_MODEL` | 70B parameters, strong reasoning, tool calling, 131K context |
 | vision_analysis | `meta-llama/llama-4-scout-17b-16e-instruct` | `GROQ_VISION_MODEL` | Only vision-capable model on Groq free tier, 750 t/s, up to 5 images/req |
 
@@ -1258,10 +1326,10 @@ sample-policy.md
 
 ### 5.1 Overview
 
-The vision module is a **four-node reasoning pipeline** within the LangGraph graph (§3.6):
+The vision module is a **three-node reasoning pipeline** within the LangGraph graph (§3.6):
 `evidence_planner` → `vision_analysis` → `claim_validator`. It is preceded upstream by
-`claim_extractor` and `policy_checker` which together determine *what to validate* before
-the vision model is ever called.
+`claim_state_updater` and `policy_checker`, which together determine *what to validate*
+before the vision model is ever called.
 
 **Core principle:** Vision is claim-driven, not image-driven. The system never asks
 "what's in this image?" It asks "does this image support or contradict what the user
@@ -1355,7 +1423,7 @@ class VisionReport(BaseModel):
 ### 5.3 Full Pipeline Flow
 
 ```
-state.user_claims  (set by claim_extractor — §5.4)
+state.user_claims  (set by claim_state_updater — §5.4)
         │
         ▼
 [policy_checker]   (llama-3.1-8b-instant + RAG per claim)
@@ -1428,15 +1496,23 @@ state.user_claims  (set by claim_extractor — §5.4)
 
 ---
 
-### 5.4 Claim Extractor Node
+### 5.4 Claim State Updater Node
 
-`claim_extractor` runs before the router on every turn (after `context_extractor`). It
-reads the full conversation history and extracts / updates the list of distinct claims
-the user has made. New claims are appended; existing ones are preserved.
+`claim_state_updater` runs after the router and only on claim-progressing turns. It
+replaces the older `context_extractor` + `claim_extractor` split with one merged pass
+that updates `ClaimContext` and normalized `UserClaim` assertions together.
 
 **Model:** `llama-3.1-8b-instant`
 
-**Example extraction:**
+**Why this merged design is better:**
+
+- avoids mutating claim state for greetings, cancellations, and policy-only questions
+- removes duplicate extraction logic across two adjacent nodes
+- preserves a cleaner behavioural boundary: route first, then update claim memory
+- lets multi-claim switch handling store a `pending_claim_draft` instead of asking the
+  user to restate information already extracted
+
+**Example merged update:**
 
 ```
 Conversation so far:
@@ -1444,24 +1520,29 @@ Conversation so far:
   Turn 2: "I never dropped it in water"
   Turn 3: "I bought it about 8 months ago"
 
-Extracted UserClaims:
+Updated ClaimContext:
+  {
+    component: "screen",
+    incident_type: "physical_damage",
+    incident_description: "screen cracked during normal use",
+    purchase_date: "2024-08-xx",
+    damage_photo_provided: False
+  }
+
+Normalized UserClaims:
   [
-    { assertion: "physical_damage",       component: "screen",
+    { assertion: "physical_damage", component: "screen",
       user_statement: "screen cracked during normal use",
       requires_visual_validation: True },
 
-    { assertion: "no_liquid_contact",     component: "screen",
+    { assertion: "no_liquid_contact", component: "screen",
       user_statement: "I never dropped it in water",
-      requires_visual_validation: True },
-
-    { assertion: "within_warranty_period", component: "screen",
-      user_statement: "bought it about 8 months ago",
-      requires_visual_validation: False }  # date check, not visual
+      requires_visual_validation: True }
   ]
 ```
 
-Claims accumulate across turns — if the user later says "and there might be a crack in
-the housing too", a new `UserClaim` is appended without touching existing ones.
+Claims still accumulate across turns, but they are merged against structured claim memory
+rather than appended blindly from the full transcript on every turn.
 
 ---
 
@@ -1474,7 +1555,7 @@ Turn 2: "I never dropped it in water, it just cracked on its own"
 Turn 3: uploads damage_photo.jpg
 ```
 
-**claim_extractor output:**
+**claim_state_updater output:**
 ```
 Claim A: physical_damage to screen, requires_visual_validation: True
 Claim B: no_liquid_contact,          requires_visual_validation: True
