@@ -1,284 +1,151 @@
 # Evals
 
-This prototype does not need a large benchmark report to be credible. It does need a defensible evaluation plan.
+## Purpose of Evals
 
-For a warranty agent, the central question is not "does the model sound good?" It is "does the system make the right decision, for the right reason, with evidence I can audit?" That changes what should be measured.
+The goal of the eval strategy is to measure whether the system can resolve warranty and claims conversations correctly, with the right evidence, and without unnecessary back-and-forth.
 
-The evaluation strategy below is built around the actual failure modes of this system:
+This is not a generic chatbot evaluation problem. The system is expected to understand what the user is asking, choose the right next step, retrieve the correct policy context, reason over that policy without hallucinating, interpret visual evidence correctly, and clearly communicate the final outcome.
 
-- routing the user into the wrong workflow
-- retrieving the wrong policy context
-- approving or rejecting a claim with weak grounding
-- over-trusting low-quality images
-- producing a response that sounds reasonable but is not operationally safe
+Because of that, the eval plan should cover both end-to-end behavior and component-level behavior. End-to-end evals tell us whether the product works as a complete system. Component-level evals help isolate where failures are coming from when end-to-end performance drops.
 
-## What I Would Optimize For
+## System Components Being Evaluated
 
-I would optimize this system against four outcomes:
+The system should be evaluated across the main components involved in claim handling:
 
-1. policy-grounded correctness
-2. low false-approval rate
-3. predictable latency and cost
-4. traceability when something goes wrong
+- Intent classification: whether the router correctly identifies what the user is trying to do
+- Planning: whether the planner chooses the correct next node or next action
+- Claim state extraction: whether the system captures the right structured claim details from the conversation
+- RAG / policy retrieval: whether the system retrieves the right policy sections needed to make a decision
+- Coverage reasoning: whether the system applies the retrieved policy correctly to the user's claim
+- Vision and evidence analysis: whether the vision model correctly interprets uploaded images without inventing damage or evidence
+- Image quality check: whether low-quality or unusable images are rejected correctly
+- Final decision generation: whether the final user-facing response clearly communicates the correct verdict with the right grounding
 
-Those priorities are deliberate. In this domain, a confident but incorrect approval is materially worse than asking for clarification or escalating to review.
+## End-to-End Evals
 
-## Evaluation Layers
+End-to-end evals should be the primary way we judge the system. The user experiences one product, not separate router, planner, retrieval, vision, and guardrail components. This layer tells us whether the full claim-handling flow works from start to finish.
 
-I would evaluate the agent at three layers, not one.
+Each end-to-end eval should represent a realistic claim scenario. That can include a multi-turn conversation, an optional image, the expected claim outcome, and the policy basis for that outcome.
 
-### 1. Component-level checks
+The main end-to-end metrics should be:
 
-These are fast regressions that isolate a single subsystem.
+- Answer correctness: whether the final response communicates the correct decision with the right policy grounding
+- Turn efficiency: how many turns it takes to resolve the claim
+- End-to-end hallucination rate: whether the final flow included fabricated policy details, unsupported reasoning, or invented visual findings
 
-- router intent classification
-- planner next-step selection
-- policy retrieval relevance
-- image-quality gate behavior
-- hallucination guardrail behavior
+We have implemented an LLM-as-judge metric for Answer Correctness.
 
-This repo already has the start of that approach in [`tests/`](/home/antpc/Desktop/chargepoint/tests): planner tests, router tests, retrieval tests, hallucination guardrail tests, and image-quality tests. That is the right foundation because it catches logic regressions before they become "LLM quality" discussions.
+This metric evaluates whether the final assistant response communicated the correct claim decision and whether that decision was properly grounded in policy. The judge reads only the user-facing conversation, not the internal agent state, because the purpose of the metric is to evaluate what the system actually communicated to the user.
 
-### 2. Scenario-level end-to-end evals
+The scoring rubric is:
 
-This is the most important layer.
+- `1.0`: correct decision, correctly grounded in policy
+- `0.5`: correct decision, but weak or missing policy grounding
+- `0.0`: incorrect decision, or no clear decision communicated
 
-I would maintain a small golden set of complete warranty scenarios, each with:
+On the current sample dataset, the baseline Answer Correctness score is `0.88` across 4 evaluated scenarios. The main gap in the current results is not incorrect decisions, but incomplete policy grounding in one partially correct case.
 
-- user turns
-- optional image attachment
-- expected retrieval target sections
-- expected final claim outcome
-- expected explanation constraints
+## Component-Level Evals
 
-The point is not to prove the system is perfect. The point is to make sure a model swap, prompt edit, retrieval change, or guardrail tweak does not silently change business behavior.
+Component-level evals are meant to isolate failures in individual parts of the system. End-to-end evals tell us whether the system worked. Component-level evals tell us where it failed.
 
-### 3. Production monitoring
+The main component-level evals for this system should be:
 
-Offline evals catch regressions in a controlled environment. They do not tell me whether the system is drifting in the field.
+- Intent classification accuracy: whether the router correctly identifies the user's intent
+- Planning accuracy: whether the planner chooses the correct next step from the current state
+- RAG evals: whether retrieval returns the right policy context needed to make the decision
+- Vision correctness: whether the vision model correctly interprets the uploaded image without inventing evidence
 
-In production I would monitor:
+For RAG, the primary metrics should be:
 
-- error and latency
-- retrieval hit quality
-- guardrail trigger rates
-- image re-upload rates
-- escalation rates
-- approval / rejection distribution shifts
+- Context recall
+- Context precision
 
-That gives a practical signal that the agent is encountering traffic it was not tuned for.
+These are especially important because retrieval quality directly affects policy grounding and final decision quality.
 
-## What I Would Measure
+## Guardrails
 
-### Routing and planning
+Some protections in the system are enforced while the agent is running, rather than evaluated only through offline component evals. These guardrails are part of the runtime safety layer and help prevent bad outputs from reaching the user or affecting the claim flow.
 
-The router and planner are cheap to test and disproportionately important.
+The main guardrails currently implemented are:
 
-Metrics:
+- Policy hallucination detection: checks whether policy reasoning is grounded and helps prevent unsupported or fabricated policy claims
+- Image quality check: blocks low-quality, blurry, or unusable images from being treated as valid evidence
+- Prompt injection detection: detects malicious or instruction-overriding inputs and prevents them from affecting the workflow
 
-- intent accuracy
-- planner next-node accuracy
-- context-switch detection precision/recall
-- incorrect terminal routing rate
+## Production Setup
 
-Failure to watch:
+A usable eval framework needs to be part of the production setup, not something run occasionally in isolation.
 
-- a user asking a policy question and getting routed into a generic conversational reply
-- a new claim being merged into the wrong existing claim context
+### Instrumentation and Trace Collection
 
-### Retrieval
+The first requirement is consistent trace capture from live runs. We have already added tracing through OpenInference, and sample traces are available in `results`. This gives us the foundation needed to inspect how the system behaved across routing, planning, retrieval, vision, guardrails, and final decision generation.
 
-For this system, retrieval quality is upstream of almost every important decision. If retrieval degrades, everything after it becomes harder to trust.
+For each production session, we should capture enough information to reconstruct and evaluate the full claim flow, including:
 
-Metrics:
+- Conversation history
+- Final claim outcome
+- Retrieved policy context
+- Planner decisions
+- Vision outputs
+- Guardrail triggers and outcomes
 
-- hit@k for expected sections
-- recall@k for required clauses
-- empty-retrieval rate
-- duplicate chunk rate after deduping
+Without this level of trace data, it is difficult to diagnose whether a failure came from intent classification, planning, retrieval, evidence handling, or response generation.
 
-Failure to watch:
+### Continuous Evaluation
 
-- correct section exists in the corpus but never appears in the retrieved top-k
-- final answer cites a clause that was never actually retrieved
+Collected traces should feed directly into the eval framework. For smaller volumes, results can be evaluated continuously as new traces come in. For larger volumes, we should not try to evaluate everything blindly. Instead, we should sample traces intelligently and prioritize the ones most likely to surface failures.
 
-### Coverage reasoning
+This is where active learning becomes useful. Rather than reviewing only random traffic, we should bias evaluation toward traces that show uncertainty, unusual behavior, guardrail activity, long conversations, or disagreement with expected patterns. That allows the eval process to stay efficient while still catching important regressions.
 
-This is where the business risk sits.
+### Evaluation Cost and Model Strategy
 
-Metrics:
+The cost of evaluation also needs to be treated as part of the production setup. Even when we use an open-source judge model such as Llama 70B, evaluation is not free. The cost simply shifts from API pricing to infrastructure, including GPU capacity, hosting, batching, scheduling, storage, and maintenance.
 
-- final verdict accuracy
-- precision / recall by verdict class
-- false approval rate
-- unsupported citation rate
-- groundedness / faithfulness score
+There is also a practical tradeoff between closed and open-source models for evaluation. Closed models are usually easier to plug in and operate, but their cost and behavior remain dependent on the provider. Open-source models give us more control over deployment, reproducibility, tuning, and long-term behavior, but they come with additional infrastructure and operational complexity. The advantage of open-source models is that their evaluation behavior is ultimately in our control, which matters if we want to tune them for the domain over time.
 
-Of these, false approval rate is the most important. If I had to choose one hard release gate for this project, it would be "do not regress false approvals."
+For that reason, the eval stack should not depend on one expensive judge for every case. It should be designed as a cost-tiered system.
 
-### Vision and evidence handling
+The first layer should be deterministic checks and standard tests for anything that does not require an LLM judge. Unit tests, scenario tests, guardrail checks, and rule-based validations should remain the cheapest layer and should run most often.
 
-The system should not behave as though an unreadable image is valid evidence.
+The second layer can use smaller or cheaper models for narrow evaluation tasks. In many places, a full large-model judge is unnecessary. Smaller classifiers, lightweight local models, or narrow deterministic evaluators can be used to validate specific behaviors such as intent quality, citation presence, trace anomalies, or unusually long claim flows.
 
-Metrics:
+The most expensive judge models should be reserved for the cases where they add the most value. That includes benchmark datasets, sampled production traces, ambiguous cases, and flows that look risky based on uncertainty, long turn count, unusual retrieval patterns, or guardrail activity.
 
-- blurry / undersized image rejection accuracy
-- invalid image fail-safe rate
-- visual-check completion rate
-- pending-for-insufficient-evidence rate
+This is also where sampling becomes important. In production, we should not evaluate every trace with the heaviest judge. We should continuously evaluate where possible, but once traffic grows, the system should move toward active sampling and prioritization. That allows us to spend evaluation cost on the traces most likely to reveal regressions or drift.
 
-Failure to watch:
+A practical long-term setup is therefore a hybrid one:
 
-- low-quality images being treated as valid evidence
-- image-analysis uncertainty being converted into unjustified confidence
+- Deterministic and unit-level checks for fast and cheap regression coverage
+- Smaller or cheaper models for filtering, triage, and narrow evaluation tasks
+- Larger judge models only for benchmark runs, sampled production traces, and hard cases
 
-### End-to-end claim handling
+That kind of layered design keeps evaluation operationally affordable while still preserving enough depth to catch failures that simple tests will miss.
 
-The user experiences the agent as one system, not five subsystems.
+### CI/CD Integration
 
-Metrics:
+The eval framework should also be part of the release pipeline. Changes to prompts, models, retrieval settings, or workflow logic should trigger evaluation before they ship.
 
-- end-to-end claim outcome accuracy
-- average turns to resolution
-- unnecessary escalation rate
-- user follow-up rate after decision
-- p50 / p95 end-to-end latency
-- token cost per resolved claim
+At a minimum, the CI/CD setup should include:
 
-## LLM-as-a-Judge
+- Scenario testing for regression coverage
+- Unit tests for component-level behavior
+- Offline benchmarking for both end-to-end and component-level evals
 
-I would use LLM-as-a-judge, but only as a regression tool, not as the source of truth.
+We have already added a few `pytest` tests in the `tests` folder, which is a good start. That coverage should be expanded further so that routing, planning, retrieval, guardrails, vision, and decision logic are all tested more thoroughly over time.
 
-Its role here is to score qualities that are expensive to check manually on every run:
+### Drift Detection
 
-- whether the final explanation is grounded in retrieved policy
-- whether the response handles uncertainty appropriately
-- whether the agent's explanation is internally consistent with the verdict
-- whether the response is clear enough for a customer-facing workflow
+Production setup should also support drift detection. Even if the system remains operational, its behavior can still shift in ways that reduce quality.
 
-I would not let the judge decide whether the business outcome is correct in isolation. For high-risk cases, especially approvals, I would anchor evaluation to expected labels and human review.
+We should monitor for changes in:
 
-### Judge input
+- Intent distribution
+- Approval, rejection, and pending rates
+- Average turns to resolution
+- Escalation rate
+- Retrieval quality
+- Policy hallucination guardrail triggers
+- Image re-upload and insufficient-evidence patterns
 
-Each scenario in the regression set should include:
-
-- the user conversation
-- retrieved policy chunks
-- any image-analysis output
-- final agent response
-- expected verdict
-
-### Judge output
-
-The judge should produce:
-
-- a pass/fail recommendation
-- rubric scores for grounding, correctness, clarity, and uncertainty handling
-- a short written rationale
-
-### Where I would not trust the judge
-
-- approval scenarios
-- ambiguous policy language
-- mixed evidence cases
-- cases where the model must say "I do not have enough evidence"
-
-Those are exactly the cases where human review still matters.
-
-## Production Observability
-
-A production-grade agent needs two kinds of observability: system telemetry and decision telemetry.
-
-### System telemetry
-
-- request rate
-- error rate
-- p50 / p95 / p99 latency
-- stream completion rate
-- Pinecone latency
-- model latency by route
-- token usage by model
-
-### Decision telemetry
-
-- retrieved chunk count
-- empty retrieval rate
-- guardrail failure / fallback rate
-- image-quality rejection rate
-- claim verdict distribution
-- escalation rate
-- manual-review rate
-
-This repo has the beginning of that foundation through [`observability/tracing.py`](/home/antpc/Desktop/chargepoint/observability/tracing.py) and streamed node traces in the agent flow, but the instrumentation is not complete yet. In particular, I would still want richer capture of retrieval details, selected chunks, intermediate planner decisions, guardrail outcomes, and the exact evidence used to reach a final claim decision.
-
-## Drift Strategy
-
-I would expect drift in three places.
-
-### Retrieval drift
-
-Causes:
-
-- policy corpus changes
-- embedding-model changes
-- Pinecone index or namespace issues
-
-Signals:
-
-- declining hit@k on the golden set
-- rising empty-retrieval rate
-- more cases where cited clauses do not appear in retrieved chunks
-
-### Image drift
-
-Causes:
-
-- different camera quality
-- worse lighting
-- new device or damage patterns
-- users uploading the wrong evidence artifact
-
-Signals:
-
-- rising re-upload rate
-- higher pending rate due to insufficient evidence
-- lower confidence in visual checks
-
-### Conversation drift
-
-Causes:
-
-- new user phrasing patterns
-- unsupported issue types
-- product-policy changes not reflected in prompts or retrieval data
-
-Signals:
-
-- increased fallback rate
-- more clarification turns
-- higher escalation rate after policy explanation
-
-## Release Gates
-
-Before I would trust a prompt or model change in this repo, I would require:
-
-- unit tests passing
-- retrieval regression set passing
-- end-to-end golden scenarios passing
-- no increase in false approval rate
-- no material regression in grounding scores
-- no unacceptable latency or cost jump
-
-That is intentionally stricter than "the outputs still look reasonable."
-
-## What I Would Build Next
-
-The fastest path from prototype to credible evaluation would be:
-
-1. create 25-50 golden end-to-end claim scenarios
-2. label each with expected sections, verdict, and explanation constraints
-3. run them in CI on every meaningful agent change
-4. score them for verdict correctness, grounding, latency, and cost
-5. require human review for approvals and ambiguous failures
-
-Those checks should be added to the CI/CD pipeline so prompt, model, retrieval, and workflow changes are evaluated before release rather than after production drift is observed.
+This is what makes the eval framework practical. It allows us to benchmark the system offline, validate changes before release, and detect when production behavior starts moving away from expected performance.

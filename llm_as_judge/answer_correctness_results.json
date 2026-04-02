@@ -1,0 +1,44 @@
+{
+  "judge_model": "groq/llama-3.3-70b-versatile",
+  "avg_goal_correctness": 0.875,
+  "sessions_evaluated": 4,
+  "sessions_skipped": [],
+  "scenarios": [
+    {
+      "session_id": "66bdfcf6-046b-4845-bf8e-c5827e37ec9b",
+      "scenario": "Cosmetic scratches \u2013 claim rejected",
+      "gt_verdict": "rejected",
+      "agent_communicated_verdict": "rejected",
+      "goal_correctness": 1.0,
+      "judgment": "correct",
+      "explanation": "The agent clearly communicated the rejected verdict and provided a policy-based justification, citing \u00a72 Cosmetic Damage Exclusion, which matches the ground-truth expected verdict and reason."
+    },
+    {
+      "session_id": "a6990ba2-47fa-40c6-9bcb-3cd8d02a38f6",
+      "scenario": "Logic board failure \u2013 claim approved",
+      "gt_verdict": "approved",
+      "agent_communicated_verdict": "approved",
+      "goal_correctness": 1.0,
+      "judgment": "correct",
+      "explanation": "The agent clearly communicated the approved verdict and provided relevant policy citations (\u00a71.1, \u00a71.2, \u00a72) to justify the replacement."
+    },
+    {
+      "session_id": "d6e41d41-fefa-4191-8485-5ecbd3a589c1",
+      "scenario": "Cosmetic scratches \u2013 claim rejected",
+      "gt_verdict": "rejected",
+      "agent_communicated_verdict": "rejected",
+      "goal_correctness": 1.0,
+      "judgment": "correct",
+      "explanation": "The agent clearly communicated the verdict as rejected, citing the correct policy reason (\u00a72 Cosmetic Damage Exclusion) for the exclusion of cosmetic damage from warranty coverage."
+    },
+    {
+      "session_id": "d9e78976-e5a5-42e2-ab60-3260779a4989",
+      "scenario": "Dead pixels above threshold \u2013 claim approved",
+      "gt_verdict": "approved",
+      "agent_communicated_verdict": "approved",
+      "goal_correctness": 0.5,
+      "judgment": "partial",
+      "explanation": "The agent correctly communicated the approved verdict, but the reasoning provided was vague and did not explicitly cite the policy or relevant clauses."
+    }
+  ]
+}

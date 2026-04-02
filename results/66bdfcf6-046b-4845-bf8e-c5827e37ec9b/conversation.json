@@ -11,10 +11,10 @@
       "purchase_date": "2 months back",
       "has_receipt": false,
       "has_image": true,
-      "claim_status": "cancelled",
-      "warranty_eligible": null,
+      "claim_status": "rejected",
+      "warranty_eligible": false,
       "audit_notes": [
-        "Cancelled by user request."
+        "Cosmetic damage excluded from warranty coverage (§2 Cosmetic Damage Exclusion); scratches are wear and tear, not a manufacturing defect."
       ]
     }
   ],
@@ -45,7 +45,7 @@
     },
     {
       "role": "assistant",
-      "content": "Your claim has been cancelled as requested. If you change your mind or have a different issue, feel free to start a new claim."
+      "content": "I understand your frustration. Unfortunately, your claim has been rejected as scratches and cosmetic wear are not covered under warranty (§2 Cosmetic Damage Exclusion). If you have a different issue with your device, feel free to start a new claim."
     },
     {
       "role": "user",
