@@ -125,6 +125,10 @@ def fast_llm(
         },
     ) as span:
         try:
+            if _should_log_payloads():
+                span.set_attribute(
+                    "llm.prompt", _summarize_messages(messages, _payload_log_limit())
+                )
             resp = litellm.completion(
                 model=model,
                 messages=messages,
@@ -135,6 +139,8 @@ def fast_llm(
             )
             text = resp.choices[0].message.content or ""
             span.set_attribute("llm.response_length", len(text))
+            if _should_log_payloads():
+                span.set_attribute("llm.response", _truncate(text, _payload_log_limit()))
             if resp.usage:
                 span.set_attribute("llm.tokens.prompt", resp.usage.prompt_tokens or 0)
                 span.set_attribute("llm.tokens.completion", resp.usage.completion_tokens or 0)
@@ -162,6 +168,10 @@ def main_llm(
         },
     ) as span:
         try:
+            if _should_log_payloads():
+                span.set_attribute(
+                    "llm.prompt", _summarize_messages(messages, _payload_log_limit())
+                )
             resp = litellm.completion(
                 model=model,
                 messages=messages,
@@ -171,6 +181,8 @@ def main_llm(
             )
             text = resp.choices[0].message.content or ""
             span.set_attribute("llm.response_length", len(text))
+            if _should_log_payloads():
+                span.set_attribute("llm.response", _truncate(text, _payload_log_limit()))
             if resp.usage:
                 span.set_attribute("llm.tokens.prompt", resp.usage.prompt_tokens or 0)
                 span.set_attribute("llm.tokens.completion", resp.usage.completion_tokens or 0)

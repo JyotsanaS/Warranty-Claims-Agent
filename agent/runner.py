@@ -114,7 +114,6 @@ def stream_agent_response(
         "awaiting_feedback": awaiting_feedback,
         "user_feedback": user_feedback,
         "terminate_session": False,
-        "claim_state_updated_this_turn": False,
         "intent": "",
         "router_confidence": 0.0,
         "context_switch_detected": False,
@@ -139,11 +138,11 @@ def stream_agent_response(
         openinference_trace_id = f"{session_span.get_span_context().trace_id:032x}"
         graph_iter = iter(graph.stream(initial_state, stream_mode="updates"))
         while True:
-            try:
-                with otel_trace.use_span(session_span, end_on_exit=False):
+            with otel_trace.use_span(session_span, end_on_exit=False):
+                try:
                     step = next(graph_iter)
-            except StopIteration:
-                break
+                except StopIteration:
+                    break
             for node_name, updates in step.items():
                 logger.debug("Node completed: %s", node_name)
                 if updates is None:

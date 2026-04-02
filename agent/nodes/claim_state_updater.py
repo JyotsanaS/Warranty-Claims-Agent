@@ -131,11 +131,8 @@ def claim_state_updater_node(state: AgentState) -> dict:
             return {
                 "claim_items": claim_items,
                 "active_claim_index": active_index,
-                "claim_state_updated_this_turn": True,
             }
-        return {
-            "claim_state_updated_this_turn": True,
-        }
+        return {}
 
     active_claim = (
         dict(claim_items[active_index])
@@ -145,7 +142,7 @@ def claim_state_updater_node(state: AgentState) -> dict:
 
     relevant_history = [
         m for m in history if m.get("role") in ("user", "assistant")
-    ][-6:]
+    ][-10:]
     conversation = "\n".join(
         f"{m['role'].upper()}: {m['content']}" for m in relevant_history
     )
@@ -221,5 +218,4 @@ def claim_state_updater_node(state: AgentState) -> dict:
         "context_switch_detected": context_switch,
         "pending_switch_confirmation": pending_confirmation,
         "pending_claim_draft": pending_claim_draft,
-        "claim_state_updated_this_turn": True,
     }

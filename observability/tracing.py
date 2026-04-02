@@ -149,7 +149,7 @@ def start_linked_span(name: str, parent_span, attributes: dict[str, Any] | None 
     with tracer.start_as_current_span(
         name,
         context=parent_context,
-    ):
+    ) as span:
         for key, value in (attributes or {}).items():
             span.set_attribute(key, _json_safe(value))
         yield span

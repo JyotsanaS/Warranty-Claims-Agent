@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 
-from observability.tracing import start_span
+from observability.tracing import start_span, _json_safe
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,13 @@ def retrieve(query: str, top_k: int | None = None) -> list[dict]:
                         }
                     )
             span.set_attribute("rag.results_count", len(chunks))
+            span.set_attribute(
+                "rag.retrieved_chunks",
+                _json_safe([
+                    {"section": c["section"], "score": c["score"], "text": c["text"][:300]}
+                    for c in chunks
+                ]),
+            )
             logger.debug("RAG: %d chunks above threshold for query %r", len(chunks), query[:60])
             return chunks
 
