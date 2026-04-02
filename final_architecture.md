@@ -81,7 +81,7 @@ This separation is intentional: the router answers **"what does the user want?"*
 
 ## Key Design Patterns
 1. **Two-stage dispatch** — router classifies intent via LLM; planner translates intent + full state into an execution decision via pure logic (no LLM)
-2. **Planner is the brain** — all routing decisions after the initial router live in `planner_node` (pure logic, no LLM)
+2. **Planner is the brain** — all routing decisions after the initial router live in `planner_node`
 3. **Loop-back pattern** — most nodes return to planner after completing, enabling multi-step pipelines in one turn
 4. **RAG → LLM pipeline** — `policy_checker` retrieves chunks then calls LLM; `evidence_planner` → `vision_analysis` → `claim_validator` is a 3-step image validation pipeline
 5. **Observability** — every node is wrapped with `_instrument_node` for OpenTelemetry tracing; `runner.py` emits SSE events (`node_trace`, `tool_call`, `tool_result`, `text_delta`, `claim_decision`, `done`)
