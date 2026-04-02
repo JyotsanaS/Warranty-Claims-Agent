@@ -1,0 +1,57 @@
+{
+  "judge_model": "groq/llama-3.3-70b-versatile",
+  "avg_turn_efficiency": 1.0,
+  "avg_total_turns": 7.0,
+  "sessions_evaluated": 4,
+  "sessions_skipped": [],
+  "scenarios": [
+    {
+      "session_id": "66bdfcf6-046b-4845-bf8e-c5827e37ec9b",
+      "scenario": "Cosmetic scratches \u2013 claim rejected",
+      "gt_verdict": "rejected",
+      "user_turns": 4,
+      "assistant_turns": 4,
+      "total_turns": 8,
+      "claim_resolved": true,
+      "turn_efficiency": 1.0,
+      "judgment": "efficient",
+      "explanation": "The assistant resolved the claim in a reasonable number of turns, asking only for necessary information and avoiding repetitive clarification."
+    },
+    {
+      "session_id": "a6990ba2-47fa-40c6-9bcb-3cd8d02a38f6",
+      "scenario": "Logic board failure \u2013 claim approved",
+      "gt_verdict": "approved",
+      "user_turns": 3,
+      "assistant_turns": 3,
+      "total_turns": 6,
+      "claim_resolved": true,
+      "turn_efficiency": 1.0,
+      "judgment": "efficient",
+      "explanation": "The assistant resolved the claim in a reasonable number of turns, asking only necessary questions to assess the situation and provide a replacement, with no unnecessary back-and-forth."
+    },
+    {
+      "session_id": "d6e41d41-fefa-4191-8485-5ecbd3a589c1",
+      "scenario": "Cosmetic scratches \u2013 claim rejected",
+      "gt_verdict": "rejected",
+      "user_turns": 4,
+      "assistant_turns": 4,
+      "total_turns": 8,
+      "claim_resolved": true,
+      "turn_efficiency": 1.0,
+      "judgment": "efficient",
+      "explanation": "The assistant resolved the claim in a reasonable number of turns, asking only for necessary information and avoiding unnecessary back-and-forth."
+    },
+    {
+      "session_id": "d9e78976-e5a5-42e2-ab60-3260779a4989",
+      "scenario": "Dead pixels above threshold \u2013 claim approved",
+      "gt_verdict": "approved",
+      "user_turns": 3,
+      "assistant_turns": 3,
+      "total_turns": 6,
+      "claim_resolved": true,
+      "turn_efficiency": 1.0,
+      "judgment": "efficient",
+      "explanation": "The assistant resolved the claim in a reasonable number of turns, asking only for necessary information and moving the claim toward resolution efficiently."
+    }
+  ]
+}

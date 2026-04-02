@@ -1,0 +1,125 @@
+{
+  "avg_context_recall": 1.0,
+  "avg_context_precision": 0.5,
+  "scenarios_evaluated": 4,
+  "scenarios": [
+    {
+      "session_id": "d6e41d41-fefa-4191-8485-5ecbd3a589c1",
+      "scenario": "Cosmetic scratches \u2013 claim rejected",
+      "query_plan": [
+        "external housing casing scratches faded cosmetic damage",
+        "standard exclusions cosmetic damage scratches discoloration"
+      ],
+      "gt_sections": [
+        "2. External Housing/Casing",
+        "3. Cosmetic Damage"
+      ],
+      "retrieved_sections": [
+        "3. Standard Exclusions (The \"No-Go\" List)",
+        "2. Specific Component Coverage",
+        "3. Standard Exclusions (The \"No-Go\" List)",
+        "3. Standard Exclusions (The \"No-Go\" List)",
+        "2. Specific Component Coverage"
+      ],
+      "retrieved_chunk_count": 5,
+      "relevant_chunk_count": 2,
+      "matched_gt_sections": [
+        "2. External Housing/Casing",
+        "3. Cosmetic Damage"
+      ],
+      "missed_gt_sections": [],
+      "context_recall": 1.0,
+      "context_precision": 0.4
+    },
+    {
+      "session_id": "66bdfcf6-046b-4845-bf8e-c5827e37ec9b",
+      "scenario": "Cosmetic scratches \u2013 claim rejected",
+      "query_plan": [
+        "external housing casing scratches faded cosmetic damage",
+        "standard exclusions cosmetic damage scratches discoloration"
+      ],
+      "gt_sections": [
+        "2. External Housing/Casing",
+        "3. Cosmetic Damage"
+      ],
+      "retrieved_sections": [
+        "3. Standard Exclusions (The \"No-Go\" List)",
+        "2. Specific Component Coverage",
+        "3. Standard Exclusions (The \"No-Go\" List)",
+        "3. Standard Exclusions (The \"No-Go\" List)",
+        "2. Specific Component Coverage"
+      ],
+      "retrieved_chunk_count": 5,
+      "relevant_chunk_count": 2,
+      "matched_gt_sections": [
+        "2. External Housing/Casing",
+        "3. Cosmetic Damage"
+      ],
+      "missed_gt_sections": [],
+      "context_recall": 1.0,
+      "context_precision": 0.4
+    },
+    {
+      "session_id": "a6990ba2-47fa-40c6-9bcb-3cd8d02a38f6",
+      "scenario": "Logic board failure \u2013 claim approved",
+      "query_plan": [
+        "main logic board replacement unit stopped turning on",
+        "general limited warranty installed by certified technician warranty period",
+        "claim validation requirements invoice serial number receipt"
+      ],
+      "gt_sections": [
+        "1. Normal Use Defined",
+        "2. Main Logic Board",
+        "4. Claim Validation Requirements"
+      ],
+      "retrieved_sections": [
+        "4. Claim Validation Requirements",
+        "2. Specific Component Coverage",
+        "Introduction",
+        "3. Standard Exclusions (The \"No-Go\" List)",
+        "1. General Limited Warranty"
+      ],
+      "retrieved_chunk_count": 5,
+      "relevant_chunk_count": 3,
+      "matched_gt_sections": [
+        "1. Normal Use Defined",
+        "2. Main Logic Board",
+        "4. Claim Validation Requirements"
+      ],
+      "missed_gt_sections": [],
+      "context_recall": 1.0,
+      "context_precision": 0.6
+    },
+    {
+      "session_id": "d9e78976-e5a5-42e2-ab60-3260779a4989",
+      "scenario": "Dead pixels above threshold \u2013 claim approved",
+      "query_plan": [
+        "led display touchscreen dead pixels more than 5",
+        "general limited warranty device 8 months warranty period",
+        "claim validation requirements serial number photo"
+      ],
+      "gt_sections": [
+        "1. Normal Use Defined",
+        "2. LED Display / Touchscreen",
+        "4. Claim Validation Requirements"
+      ],
+      "retrieved_sections": [
+        "4. Claim Validation Requirements",
+        "1. General Limited Warranty",
+        "3. Standard Exclusions (The \"No-Go\" List)",
+        "2. Specific Component Coverage",
+        "3. Standard Exclusions (The \"No-Go\" List)"
+      ],
+      "retrieved_chunk_count": 5,
+      "relevant_chunk_count": 3,
+      "matched_gt_sections": [
+        "1. Normal Use Defined",
+        "2. LED Display / Touchscreen",
+        "4. Claim Validation Requirements"
+      ],
+      "missed_gt_sections": [],
+      "context_recall": 1.0,
+      "context_precision": 0.6
+    }
+  ]
+}

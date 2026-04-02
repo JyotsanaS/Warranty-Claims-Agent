@@ -1,5 +1,25 @@
 # Evals
 
+## Table of Contents
+
+- [Purpose of Evals](#purpose-of-evals)
+- [System Components Being Evaluated](#system-components-being-evaluated)
+- [End-to-End Evals](#end-to-end-evals)
+  - [Answer Correctness](#answer-correctness)
+  - [Turn Efficiency](#turn-efficiency)
+- [Component-Level Evals](#component-level-evals)
+  - [Context Precision & Context Recall](#context-precision--context-recall)
+  - [Vision Correctness](#vision-correctness)
+- [Conversation Quality](#conversation-quality)
+- [Safety and Boundary Behavior](#safety-and-boundary-behavior)
+- [Guardrails](#guardrails)
+- [Production Setup](#production-setup)
+  - [Instrumentation and Trace Collection](#instrumentation-and-trace-collection)
+  - [Continuous Evaluation](#continuous-evaluation)
+  - [Evaluation Cost and Model Strategy](#evaluation-cost-and-model-strategy)
+  - [CI/CD Integration](#cicd-integration)
+  - [Drift Detection](#drift-detection)
+
 ## Purpose of Evals
 
 The goal of the eval strategy is to measure whether the system can resolve warranty and claims conversations correctly, with the right evidence, and without unnecessary back-and-forth.
@@ -7,6 +27,12 @@ The goal of the eval strategy is to measure whether the system can resolve warra
 This is not a generic chatbot evaluation problem. The system is expected to understand what the user is asking, choose the right next step, retrieve the correct policy context, reason over that policy without hallucinating, interpret visual evidence correctly, and clearly communicate the final outcome.
 
 Because of that, the eval plan should cover both end-to-end behavior and component-level behavior. End-to-end evals tell us whether the product works as a complete system. Component-level evals help isolate where failures are coming from when end-to-end performance drops.
+
+The eval plan should also cover conversation quality, because correct decisions still need to be communicated in a way that feels clear, professional, and appropriate to the user.
+
+It should also cover safety and boundary behavior, because the system needs to respond well when users go out of scope, ask unrelated questions, or behave aggressively.
+
+Guardrails should be treated as a separate runtime layer, because they are enforced while the agent is running and are meant to prevent specific failure modes before they affect the workflow.
 
 ## System Components Being Evaluated
 
@@ -31,8 +57,8 @@ The main end-to-end metrics should be:
 
 - Answer correctness: whether the final response communicates the correct decision with the right policy grounding
 - Turn efficiency: how many turns it takes to resolve the claim
-- End-to-end hallucination rate: whether the final flow included fabricated policy details, unsupported reasoning, or invented visual findings
 
+#### Answer Correctness
 We have implemented an LLM-as-judge metric for Answer Correctness.
 
 This metric evaluates whether the final assistant response communicated the correct claim decision and whether that decision was properly grounded in policy. The judge reads only the user-facing conversation, not the internal agent state, because the purpose of the metric is to evaluate what the system actually communicated to the user.
@@ -44,6 +70,19 @@ The scoring rubric is:
 - `0.0`: incorrect decision, or no clear decision communicated
 
 On the current sample dataset, the baseline Answer Correctness score is `0.88` across 4 evaluated scenarios. The main gap in the current results is not incorrect decisions, but incomplete policy grounding in one partially correct case.
+
+#### Turn Efficiency
+We have also implemented an LLM-as-judge metric for Turn Efficiency.
+
+This metric uses the saved conversation trace to count the number of user and assistant turns, and then asks the judge whether the claim was resolved in a reasonable number of turns without unnecessary back-and-forth. The purpose of the metric is not just to count turns mechanically, but to evaluate whether those turns were actually necessary for resolution.
+
+The scoring rubric is:
+
+- `1.0`: claim was resolved efficiently with no clearly unnecessary turns
+- `0.5`: claim was mostly resolved efficiently, but with some avoidable back-and-forth
+- `0.0`: claim flow was inefficient, repetitive, or took unnecessary turns to reach resolution
+
+On the current sample dataset, the baseline Turn Efficiency score is `1.00` across 4 evaluated scenarios, with an average of `7.00` total turns per conversation.
 
 ## Component-Level Evals
 
@@ -62,6 +101,57 @@ For RAG, the primary metrics should be:
 - Context precision
 
 These are especially important because retrieval quality directly affects policy grounding and final decision quality.
+
+#### Context Precision & Context Recall
+We have implemented a deterministic evaluator for RAG Context Recall and Context Precision.
+
+This evaluator uses the sample dataset to define the ground-truth policy sections that should be retrieved for each scenario. It then runs the live retrieval path, compares the retrieved chunks against those ground-truth sections, and scores retrieval quality at the section level.
+
+The metrics are defined as:
+
+- `Context recall`: number of required policy sections retrieved divided by total required policy sections
+- `Context precision`: number of relevant retrieved chunks divided by total retrieved chunks
+
+On the current sample dataset, the baseline Context Recall score is `1.00` across 4 evaluated scenarios. The baseline Context Precision score is `0.50`, which means the retriever is finding the needed policy sections, but is still returning extra irrelevant chunks in the final retrieved context.
+
+#### Vision Correctness
+We have implemented an LLM-as-judge metric for Vision Correctness.
+
+This metric runs in two steps. It first extracts a normalized vision claim from the saved trace, based on what the system concluded about the image during the actual run. It then compares that extracted vision claim against the ground-truth `vision_gt` label in the sample dataset.
+
+The scoring rubric is:
+
+- `1.0`: extracted vision claim matches the ground truth
+- `0.5`: extracted vision claim is partially aligned but loses important detail
+- `0.0`: extracted vision claim does not match the ground truth, or no clear vision claim was extracted when one was needed
+
+On the current sample dataset, the baseline Vision Correctness score is `1.00` across 4 evaluated scenarios.
+
+## Conversation Quality
+
+The system should also be evaluated on how it communicates with the user, not just whether it reaches the correct decision. In a claims workflow, response quality matters because the user may already be frustrated, confused, or looking for reassurance that the case is being handled correctly.
+
+The main conversation quality metrics should be:
+
+- Politeness: whether the response is respectful and professional
+- Empathy: whether the system acknowledges user frustration or concern when appropriate
+- Opening quality: whether the response starts appropriately for the context, without sounding abrupt or unnecessarily repetitive
+- Closing quality: whether the response ends clearly and helpfully, including next steps when needed
+- Clarity and professionalism: whether the response is easy to understand, structured well, and communicated in a professional tone
+
+These metrics should be judged in context. Not every turn requires a greeting, and not every response needs explicit empathy. The goal is not to optimize for formulaic language, but for communication that feels appropriate to the situation.
+
+## Safety and Boundary Behavior
+
+The system should also be evaluated on how it behaves when the user goes outside the expected claims workflow. This includes cases where the user is abusive, asks unrelated questions, or pushes the assistant beyond its intended scope.
+
+The main safety and boundary behavior metrics should be:
+
+- Out-of-domain handling: whether unrelated requests are redirected appropriately without confusing the user
+- Refusal quality: whether the system refuses only when necessary, and does so clearly and professionally
+- Toxicity handling: whether the assistant remains calm, safe, and professional even when the user is rude, aggressive, or abusive
+
+These evals are different from runtime guardrails. Guardrails are designed to block specific failure modes such as prompt injection, policy hallucination, and low-quality image input while the system is running. Safety and boundary behavior evals are meant to measure whether the assistant responds appropriately from the user’s point of view.
 
 ## Guardrails
 
