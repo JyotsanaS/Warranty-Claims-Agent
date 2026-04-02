@@ -74,8 +74,6 @@ def assess_coverage(component: str, statement: str, chunks: list[dict]) -> dict:
         try:
             data = json.loads(raw)
             result = PolicyCoverage(**data).model_dump()
-            span.set_attribute("coverage.covered", bool(result.get("covered")))
-            return result
         except Exception as exc:
             span.record_exception(exc)
             logger.warning("Coverage assessment parse failed for %s", component)
@@ -85,3 +83,59 @@ def assess_coverage(component: str, statement: str, chunks: list[dict]) -> dict:
             ).model_dump()
             span.set_attribute("coverage.covered", False)
             return result
+
+        # Hallucination check — only on approvals; rejections are conservative by default
+        if result.get("covered"):
+            from agent.guardrails.hallucination import is_grounded
+            grounded = is_grounded(
+                value=raw,
+                reference=context,
+                query=f"{component}: {statement}",
+            )
+            if not grounded:
+                logger.warning(
+                    "Coverage hallucination detected for %s — retrying with stricter prompt", component
+                )
+                stricter_messages = [
+                    {
+                        "role": "system",
+                        "content": get_prompt("coverage_service", "coverage_system")
+                        + "\n\nIMPORTANT: Only cite policy clauses that appear verbatim "
+                        "in the provided policy sections. Do not infer or paraphrase.",
+                    },
+                    messages[1],
+                ]
+                raw_retry = fast_llm(stricter_messages, json_mode=True)
+                try:
+                    data_retry = json.loads(raw_retry)
+                    result_retry = PolicyCoverage(**data_retry).model_dump()
+                except Exception:
+                    result_retry = None
+
+                if result_retry and result_retry.get("covered"):
+                    grounded_retry = is_grounded(
+                        value=raw_retry,
+                        reference=context,
+                        query=f"{component}: {statement}",
+                    )
+                else:
+                    grounded_retry = bool(result_retry and not result_retry.get("covered"))
+
+                if grounded_retry and result_retry:
+                    result = result_retry
+                    span.set_attribute("coverage.hallucination_retry_passed", True)
+                else:
+                    result = PolicyCoverage(
+                        covered=False,
+                        exclusion_reason=(
+                            "Coverage not grounded in retrieved policy. Manual review required."
+                        ),
+                    ).model_dump()
+                    span.set_attribute("coverage.hallucination_fallback", True)
+                    logger.warning(
+                        "Coverage hallucination fallback applied for %s — downgraded to not covered",
+                        component,
+                    )
+
+        span.set_attribute("coverage.covered", bool(result.get("covered")))
+        return result

@@ -27,8 +27,7 @@ class Settings(BaseSettings):
     rag_similarity_threshold: float = 0.75
     rag_top_k: int = 5
 
-    # Image storage
-    image_upload_dir: str = "./data/images"
+    # Storage
     image_max_size_mb: int = 10
     results_dir: str = "./results"
 

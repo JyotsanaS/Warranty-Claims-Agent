@@ -76,13 +76,10 @@ def planner_node(state: AgentState) -> dict:
         plan = ["Extract structured claim details from the current turn", "Continue planning"]
         next_node = "claim_state_updater"
         reason = "This turn may add or update claim context before downstream reasoning."
-    elif awaiting_post_resolution_followup and is_negative_reply(last_user):
+    elif awaiting_post_resolution_followup:
         plan = ["Close the resolved support conversation", "Request feedback"]
         next_node = "post_resolution_close_node"
-        reason = "The user declined further help after a final claim outcome."
-    elif awaiting_post_resolution_followup:
-        state_updates["awaiting_post_resolution_followup"] = False
-        state_updates["claim_state_updated_this_turn"] = False
+        reason = "Claim outcome delivered; collecting feedback and closing session."
     elif intent in _SIMPLE_INTENT_ROUTES:
         next_node = _SIMPLE_INTENT_ROUTES[intent]
         plan = [f"Handle {intent.replace('_', ' ')} request directly", "Return response"]

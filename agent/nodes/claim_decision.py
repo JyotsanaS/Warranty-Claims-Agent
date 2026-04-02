@@ -13,6 +13,28 @@ from models.state import AgentState
 logger = logging.getLogger(__name__)
 
 
+def _build_templated_decision(user_claims: list[dict], policy_clauses: list[str]) -> str:
+    """
+    Deterministic fallback prose when LLM output fails the hallucination check twice.
+    Verdict is never changed — only the explanation is replaced with pre-verified data.
+    """
+    lines = ["Based on our policy review, here is your claim outcome:"]
+    for claim in user_claims:
+        component = claim.get("component", "claim")
+        verdict = (claim.get("claim_verdict") or "pending").upper()
+        coverage = claim.get("policy_coverage") or {}
+        clauses = coverage.get("policy_clauses", [])
+        line = f"- {component}: {verdict}"
+        if clauses:
+            line += f" (policy reference: {', '.join(clauses)})"
+        elif verdict == "REJECTED" and coverage.get("exclusion_reason"):
+            line += f" — {coverage['exclusion_reason']}"
+        lines.append(line)
+    if policy_clauses:
+        lines.append(f"\nApplicable policy clauses: {', '.join(policy_clauses)}")
+    return "\n".join(lines)
+
+
 def claim_decision_node(state: AgentState) -> dict:
     user_claims = state.get("user_claims", [])
     policy_clauses = state.get("policy_clauses", [])
@@ -51,6 +73,43 @@ def claim_decision_node(state: AgentState) -> dict:
     text = main_llm(messages, temperature=0.2)
     if not text:
         text = "Your claim has been reviewed."
+
+    # Hallucination check — guard the customer-facing prose against ungrounded clause citations
+    reference = "\n---\n".join(policy_context[:3]) if policy_context else ""
+    if reference and text:
+        from agent.guardrails.hallucination import is_grounded
+        grounded = is_grounded(
+            value=text,
+            reference=reference,
+            query="Final warranty claim decision",
+        )
+        if not grounded:
+            logger.warning("Claim decision hallucination detected — retrying with stricter prompt")
+            stricter_system = (
+                system_content
+                + f"\n\nIMPORTANT: Cite only the following pre-verified policy clauses: "
+                f"{policy_clauses}. Do not reference any other clause names."
+            )
+            retry_messages = [
+                {"role": "system", "content": stricter_system},
+                messages[1],
+            ]
+            retry_text = main_llm(retry_messages, temperature=0.2)
+            if retry_text:
+                grounded_retry = is_grounded(
+                    value=retry_text,
+                    reference=reference,
+                    query="Final warranty claim decision",
+                )
+                if grounded_retry:
+                    text = retry_text
+                else:
+                    logger.warning(
+                        "Claim decision hallucination persists after retry — using templated fallback"
+                    )
+                    text = _build_templated_decision(user_claims, policy_clauses)
+            else:
+                text = _build_templated_decision(user_claims, policy_clauses)
 
     recorded_lines: list[str] = []
     case_reference = f"VE-{state.get('session_id', 'UNKNOWN')[-8:].upper()}"

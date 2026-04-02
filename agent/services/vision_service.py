@@ -11,7 +11,7 @@ import mimetypes
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image
 
 from agent.prompt_store import get_prompt
 from gateway.llm_gateway import vision_llm
@@ -62,14 +62,12 @@ def _check_image_quality(raw_bytes: bytes) -> str | None:
         if w < _MIN_DIMENSION_PX or h < _MIN_DIMENSION_PX:
             return f"image_too_small (got {w}x{h}, minimum {_MIN_DIMENSION_PX}x{_MIN_DIMENSION_PX})"
 
-        gray = img.convert("L")
-        laplacian = gray.filter(ImageFilter.Kernel(
-            size=3,
-            kernel=[0, 1, 0, 1, -4, 1, 0, 1, 0],
-            scale=1,
-            offset=128,
-        ))
-        variance = float(np.array(laplacian).var())
+        arr = np.array(img.convert("L"), dtype=np.float32)
+        laplacian = (
+            np.roll(arr, 1, axis=0) + np.roll(arr, -1, axis=0) +
+            np.roll(arr, 1, axis=1) + np.roll(arr, -1, axis=1) - 4 * arr
+        )
+        variance = float(laplacian.var())
         if variance < _BLUR_VARIANCE_THRESHOLD:
             return f"image_too_blurry (variance={variance:.1f}, threshold={_BLUR_VARIANCE_THRESHOLD})"
     except Exception as exc:
