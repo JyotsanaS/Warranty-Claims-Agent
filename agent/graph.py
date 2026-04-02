@@ -40,6 +40,7 @@ from agent.nodes.simple_nodes import (
     feedback_node,
     greeting_node,
     post_resolution_close_node,
+    prompt_injection_node,
     status_node,
 )
 from agent.nodes.vision_analysis import vision_analysis_node
@@ -85,6 +86,7 @@ def _route_from_planner(state: AgentState) -> str:
         "status_node",
         "post_resolution_close_node",
         "feedback_node",
+        "prompt_injection_node",
         "empathy_node",
         "claim_state_updater",
         "policy_checker",
@@ -117,6 +119,7 @@ def _build_graph() -> StateGraph:
     g.add_node("status_node", _instrument_node("status_node", status_node))
     g.add_node("post_resolution_close_node", _instrument_node("post_resolution_close_node", post_resolution_close_node))
     g.add_node("feedback_node", _instrument_node("feedback_node", feedback_node))
+    g.add_node("prompt_injection_node", _instrument_node("prompt_injection_node", prompt_injection_node))
     g.add_node("empathy_node", _instrument_node("empathy_node", empathy_node))
     g.add_node("planner", _instrument_node("planner", planner_node))
     g.add_node("policy_checker", _instrument_node("policy_checker", policy_checker_node))
@@ -145,6 +148,7 @@ def _build_graph() -> StateGraph:
     g.add_edge("status_node", END)
     g.add_edge("post_resolution_close_node", END)
     g.add_edge("feedback_node", END)
+    g.add_edge("prompt_injection_node", END)
 
     # Empathy always defers execution decisions to planner.
     g.add_conditional_edges(
@@ -168,6 +172,7 @@ def _build_graph() -> StateGraph:
             "status_node": "status_node",
             "post_resolution_close_node": "post_resolution_close_node",
             "feedback_node": "feedback_node",
+            "prompt_injection_node": "prompt_injection_node",
             "empathy_node": "empathy_node",
             "claim_state_updater": "claim_state_updater",
             "policy_checker": "policy_checker",

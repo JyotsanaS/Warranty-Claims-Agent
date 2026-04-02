@@ -15,6 +15,7 @@ from models.state import AgentState
 logger = logging.getLogger(__name__)
 
 _INTENTS = (
+    "prompt_injection",  # attempts to override policy / manipulate system state
     "greeting",       # hello / hi / how are you
     "out_of_scope",   # unrelated to warranty or claims
     "escalation",     # wants human agent, very upset
@@ -27,6 +28,8 @@ _INTENTS = (
     "evidence",       # providing a photo, receipt, or other proof
     "clarification",  # answering a follow-up question
 )
+
+_PROMPT_INJECTION_THRESHOLD = 0.7
 
 
 def _build_recent_conversation(messages: list[dict], max_turns: int = 4) -> str:
@@ -84,12 +87,61 @@ def _build_structured_memory(state: AgentState, max_claims: int = 3) -> str:
     return "\n".join(memory_lines)
 
 
+def _detect_prompt_injection(
+    last_user: str,
+    recent_conversation: str,
+    structured_memory: str,
+) -> tuple[bool, float]:
+    if not str(last_user).strip():
+        return False, 0.0
+
+    detector_input = (
+        f"Recent conversation:\n{recent_conversation}\n\n"
+        f"Structured memory:\n{structured_memory}\n\n"
+        f"Current user message:\n{last_user}"
+    )
+    messages = [
+        {"role": "system", "content": get_prompt("prompt_injection")},
+        {"role": "user", "content": detector_input},
+    ]
+
+    raw = fast_llm(messages, json_mode=True)
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("Prompt-injection detector JSON parse failed; defaulting to safe path")
+        return False, 0.0
+
+    is_injection = bool(data.get("is_prompt_injection", False))
+    confidence = float(data.get("confidence", 0.0))
+    if is_injection and confidence >= _PROMPT_INJECTION_THRESHOLD:
+        return True, confidence
+    return False, confidence
+
+
 def router_node(state: AgentState) -> dict:
-    # If awaiting feedback, bypass LLM classification
+    # If awaiting feedback, bypass all LLM calls
     if state.get("awaiting_feedback"):
         return {
             "intent": "feedback_response",
             "router_confidence": 1.0,
+        }
+
+    history = state["messages"]
+    last_user = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+    recent_conversation = _build_recent_conversation(history, max_turns=4)
+    structured_memory = _build_structured_memory(state)
+
+    is_injection, injection_confidence = _detect_prompt_injection(
+        last_user=last_user,
+        recent_conversation=recent_conversation,
+        structured_memory=structured_memory,
+    )
+    if is_injection:
+        logger.warning("Prompt-injection pattern detected by router (confidence=%.2f)", injection_confidence)
+        return {
+            "intent": "prompt_injection",
+            "router_confidence": injection_confidence,
         }
 
     # If a context switch is already pending, bypass LLM classification
@@ -99,10 +151,6 @@ def router_node(state: AgentState) -> dict:
             "router_confidence": 1.0,
         }
 
-    history = state["messages"]
-    last_user = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
-    recent_conversation = _build_recent_conversation(history, max_turns=4)
-    structured_memory = _build_structured_memory(state)
     user_content = (
         f"Recent conversation:\n{recent_conversation}\n\n"
         f"Structured memory:\n{structured_memory}\n\n"

@@ -169,7 +169,6 @@ async def send_message(
     """
     session = _require_session(session_id)
     session["last_activity_at"] = time.time()
-    _enforce_message_rate_limit(session)
 
     # ── Image validation & storage ────────────────────────────────────────────
     image_path: str | None = None
@@ -191,6 +190,8 @@ async def send_message(
     if not text and not image_path:
         raise HTTPException(status_code=400, detail="Message must include text or an image")
 
+    _enforce_message_rate_limit(session)
+
     # ── Append user message to history ────────────────────────────────────────
     session["messages"].append({"role": "user", "content": text})
 
@@ -203,6 +204,7 @@ async def send_message(
         last_trace_total_ms: int | None = None
         openinference_trace_id: str | None = None
         openinference_trace: list[dict] = []
+        close_session_after_response = False
 
         gen = stream_agent_response(
             session_id=session_id,
@@ -253,6 +255,7 @@ async def send_message(
                 openinference_trace_id = final["_openinference_trace_id"]
             if final.get("_openinference_trace") is not None:
                 openinference_trace = final["_openinference_trace"]
+            close_session_after_response = bool(final.get("terminate_session"))
             session["awaiting_first_user_turn"] = False
 
             # Save assistant reply to conversation history
@@ -268,6 +271,10 @@ async def send_message(
                 openinference_trace_id,
                 openinference_trace,
             )
+
+            if close_session_after_response:
+                _sessions.pop(session_id, None)
+                logger.info("Session %s closed by security guardrail", session_id)
         finally:
             _release_active_request(session)
 

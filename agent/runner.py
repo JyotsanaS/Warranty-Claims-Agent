@@ -40,6 +40,7 @@ _RESPONSE_NODES = {
     "confirmation_handler",
     "post_resolution_close_node",
     "feedback_node",
+    "prompt_injection_node",
     "agent_respond",
     "claim_decision",
 }
@@ -112,6 +113,7 @@ def stream_agent_response(
         "awaiting_post_resolution_followup": awaiting_post_resolution_followup,
         "awaiting_feedback": awaiting_feedback,
         "user_feedback": user_feedback,
+        "terminate_session": False,
         "claim_state_updated_this_turn": False,
         "intent": "",
         "router_confidence": 0.0,

@@ -298,6 +298,7 @@ class TestSimpleIntentRoutes:
     """Direct terminal intent routing."""
 
     @pytest.mark.parametrize("intent,expected_node", [
+        ("prompt_injection", "prompt_injection_node"),
         ("greeting",     "greeting_node"),
         ("out_of_scope", "fallback_node"),
         ("escalation",   "escalation_node"),
@@ -482,7 +483,7 @@ class TestReturnShape:
     REQUIRED_KEYS = {"execution_plan", "next_node", "planner_reason", "claim_state_updated_this_turn"}
 
     @pytest.mark.parametrize("intent", [
-        "greeting", "claim", "escalation", "frustration", "out_of_scope",
+        "greeting", "claim", "escalation", "frustration", "out_of_scope", "prompt_injection",
     ])
     def test_return_contains_required_keys(self, intent):
         state = make_state(intent=intent)

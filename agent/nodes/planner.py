@@ -8,6 +8,7 @@ from models.state import AgentState
 from agent.nodes.simple_nodes import is_negative_reply
 
 _SIMPLE_INTENT_ROUTES = {
+    "prompt_injection": "prompt_injection_node",
     "greeting": "greeting_node",
     "out_of_scope": "fallback_node",
     "escalation": "escalation_node",

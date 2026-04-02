@@ -1,7 +1,8 @@
 """
 Simple agent nodes that require minimal or no LLM calls:
   greeting_node, fallback_node, status_node,
-  escalation_node, cancellation_node, confirmation_handler, post_resolution_close_node
+  escalation_node, cancellation_node, confirmation_handler, post_resolution_close_node,
+  prompt_injection_node
 """
 from __future__ import annotations
 
@@ -231,5 +232,16 @@ def feedback_node(state: AgentState) -> dict:
     return {
         "awaiting_feedback": False,
         "user_feedback": feedback,
+        "messages": [{"role": "assistant", "content": text}],
+    }
+
+
+def prompt_injection_node(state: AgentState) -> dict:
+    text = (
+        "Sorry, we believe this request is attempting to manipulate policy or claim handling. "
+        "We are closing this session for now."
+    )
+    return {
+        "terminate_session": True,
         "messages": [{"role": "assistant", "content": text}],
     }
