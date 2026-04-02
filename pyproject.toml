@@ -20,4 +20,17 @@ dependencies = [
     "openinference-instrumentation>=0.1.46",
     "openinference-instrumentation-litellm>=0.1.30",
     "opentelemetry-sdk>=1.40.0",
+    "guardrails-ai>=0.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "ragas>=0.4.3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+markers = [
+    "integration: tests that make real LLM/API calls (require .env credentials)",
 ]

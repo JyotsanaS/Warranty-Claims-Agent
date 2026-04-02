@@ -137,7 +137,7 @@ User ──POST multipart──► FastAPI
 | Accepted formats | JPEG, PNG, WebP |
 | Max file size | 10 MB |
 | Min resolution | 200 × 200 px (below this, vision module flags as `too_small`) |
-| Storage | Saved to local filesystem under `IMAGE_UPLOAD_DIR` immediately on upload |
+| Storage | Saved to local filesystem under `RESULTS_DIR/<session_id>/images/` immediately on upload |
 | Naming convention | `{session_id}_{type}_{timestamp}.{ext}` — e.g. `sess_abc123_damage_20260331T143022.jpg` |
 | Image types | `damage` · `receipt` · `serial` |
 | Agent reference | `state.image_local_path` carries the full file path; passed to vision node |
@@ -1631,7 +1631,7 @@ No storage system is used for purposes outside its defined scope.
 | Store | Technology | Responsibility |
 |---|---|---|
 | **Conversation & agent state** | LangGraph `MemorySaver` (in-process) | Full `AgentState` per session — messages, `ClaimContext`, `UserClaims`, verdicts, token counts |
-| **Images** | Local filesystem (`IMAGE_UPLOAD_DIR`) | Raw image bytes, structured by naming convention |
+| **Images** | Local filesystem (`RESULTS_DIR`) | Raw image bytes, stored under `results/<session_id>/images/` |
 | **Policy vectors** | Pinecone (serverless) | Policy chunk embeddings + metadata for RAG retrieval |
 
 ---
@@ -1665,52 +1665,50 @@ zero business logic change (see §7.5 Future Scope).
 
 ### 7.3 Image Storage — Local Filesystem
 
-Images are saved to the local directory specified by `IMAGE_UPLOAD_DIR` (default:
-`./data/images`). The directory is created on startup if it does not exist.
+Images are saved under `RESULTS_DIR` (default: `./results`), inside a per-session
+subdirectory at `results/<session_id>/images/`. The directory is created on demand.
 
 #### Naming Convention
 
 ```
-{session_id}_{type}_{timestamp}.{ext}
+{image_type}_{timestamp}.{ext}
 ```
 
 | Segment | Values | Example |
 |---|---|---|
-| `session_id` | UUID | `sess_abc123` |
 | `type` | `damage` · `receipt` · `serial` | `damage` |
-| `timestamp` | ISO-8601 compact, UTC | `20260331T143022` |
+| `timestamp` | UTC compact timestamp with microseconds | `20260331_143022_123456` |
 | `ext` | `jpg` · `png` · `webp` | `jpg` |
 
-**Full example:** `sess_abc123_damage_20260331T143022.jpg`
+**Full example:** `damage_20260331_143022_123456.jpg`
 
-Multiple images per session are distinguished by timestamp. If a user uploads two damage
-photos in the same session the filenames are guaranteed unique.
+Multiple images per session are distinguished by timestamp and stored under the session's
+own image directory, so names remain unique and isolated per claim session.
 
 #### Write / Read Flow
 
 ```python
 # storage/image_store.py
 
-import os
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from app.config import settings
 
 def save_image(session_id: str, image_type: str,
-               data: bytes, ext: str) -> str:
+               file_bytes: bytes, extension: str) -> str:
     """
-    Saves image to local filesystem.
-    Returns the full file path stored in state.image_local_path.
+    Save image bytes under results/<session_id>/images/.
+    Returns the absolute path stored in state.image_local_path.
     """
-    upload_dir = Path(settings.IMAGE_UPLOAD_DIR)
+    upload_dir = Path(settings.results_dir) / session_id / "images"
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    filename = f"{session_id}_{image_type}_{ts}.{ext}"
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"{image_type}_{timestamp}.{extension}"
     path = upload_dir / filename
 
-    path.write_bytes(data)
-    return str(path)
+    path.write_bytes(file_bytes)
+    return str(path.resolve())
 
 
 def read_image(image_local_path: str) -> bytes:
