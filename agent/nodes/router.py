@@ -129,7 +129,7 @@ def router_node(state: AgentState) -> dict:
 
     history = state["messages"]
     last_user = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
-    recent_conversation = _build_recent_conversation(history, max_turns=4)
+    recent_conversation = _build_recent_conversation(history, max_turns=10)
     structured_memory = _build_structured_memory(state)
 
     is_injection, injection_confidence = _detect_prompt_injection(

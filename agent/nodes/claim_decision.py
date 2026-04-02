@@ -181,4 +181,5 @@ def claim_decision_node(state: AgentState) -> dict:
         "messages": [{"role": "assistant", "content": text}],
         "claim_items": updated_claim_items,
         "user_claims": user_claims,
+        "awaiting_post_resolution_followup": True,
     }

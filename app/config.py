@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     pinecone_namespace: str = "warranty_policy_v1"
 
     # RAG
-    rag_similarity_threshold: float = 0.75
+    rag_similarity_threshold: float = 0.3
     rag_top_k: int = 5
 
     # Storage

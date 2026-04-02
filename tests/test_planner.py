@@ -1,17 +1,23 @@
 """
-Unit tests for agent/nodes/planner.py
+Unit and integration tests for agent/nodes/planner.py
 
-planner_node is fully deterministic (no LLM calls), so no mocking is required.
-Every branch in the decision tree is covered.
+Layer 1 (hard rules) and Layer 2 (simple intent routes) are fully deterministic.
+Layer 3 (LLM planner) uses real LLM calls to verify routing correctness.
+_build_state_summary is tested as pure Python with no LLM.
 """
 from __future__ import annotations
+
+from unittest.mock import patch
 
 import pytest
 
 from agent.nodes.planner import (
+    _build_state_summary,
     _has_final_verdicts,
     _has_policy_grounding,
     _has_unassessed_claims,
+    _llm_planner,
+    _VALID_LLM_NODES,
     planner_node,
 )
 
@@ -19,7 +25,6 @@ from agent.nodes.planner import (
 # ── State factory ─────────────────────────────────────────────────────────────
 
 def make_state(**overrides) -> dict:
-    """Return a minimal valid AgentState dict with sensible defaults."""
     base: dict = {
         "session_id": "test-session",
         "trace_id": "test-trace",
@@ -35,7 +40,6 @@ def make_state(**overrides) -> dict:
         "user_claims": [],
         "pending_claim_draft": None,
         "awaiting_post_resolution_followup": False,
-        "claim_state_updated_this_turn": False,
         "intent": "greeting",
         "router_confidence": 0.9,
         "context_switch_detected": False,
@@ -72,7 +76,7 @@ def _uncovered_claim(**extra) -> dict:
         "assertion_type": "cosmetic",
         "verbatim_statement": "cable has a scratch",
         "requires_visual_validation": False,
-        "policy_coverage": {"covered": False, "exclusion_reason": "cosmetic damage excluded"},
+        "policy_coverage": {"covered": False, "exclusion_reason": "cosmetic damage excluded", "policy_clauses": ["§3.1"]},
         "visual_checks": [],
         "claim_verdict": "rejected",
     }
@@ -115,7 +119,6 @@ class TestHasUnassessedClaims:
         assert _has_unassessed_claims(claims) is True
 
     def test_missing_key(self):
-        # No policy_coverage key at all — treated same as None
         assert _has_unassessed_claims([{"component": "charger"}]) is True
 
 
@@ -124,8 +127,7 @@ class TestHasFinalVerdicts:
         assert _has_final_verdicts([]) is False
 
     def test_all_approved(self):
-        claims = [{"claim_verdict": "approved"}, {"claim_verdict": "approved"}]
-        assert _has_final_verdicts(claims) is True
+        assert _has_final_verdicts([{"claim_verdict": "approved"}, {"claim_verdict": "approved"}]) is True
 
     def test_all_rejected(self):
         assert _has_final_verdicts([{"claim_verdict": "rejected"}]) is True
@@ -134,12 +136,10 @@ class TestHasFinalVerdicts:
         assert _has_final_verdicts([{"claim_verdict": "escalated"}]) is True
 
     def test_mixed_final(self):
-        claims = [{"claim_verdict": "approved"}, {"claim_verdict": "rejected"}]
-        assert _has_final_verdicts(claims) is True
+        assert _has_final_verdicts([{"claim_verdict": "approved"}, {"claim_verdict": "rejected"}]) is True
 
     def test_one_pending(self):
-        claims = [{"claim_verdict": "approved"}, {"claim_verdict": "pending"}]
-        assert _has_final_verdicts(claims) is False
+        assert _has_final_verdicts([{"claim_verdict": "approved"}, {"claim_verdict": "pending"}]) is False
 
     def test_verdict_none(self):
         assert _has_final_verdicts([{"claim_verdict": None}]) is False
@@ -164,338 +164,269 @@ class TestHasPolicyGrounding:
         assert _has_policy_grounding([], [], []) is False
 
     def test_none_coverage_in_claim(self):
-        claims = [{"policy_coverage": None}]
-        assert _has_policy_grounding(claims, [], []) is False
+        assert _has_policy_grounding([{"policy_coverage": None}], [], []) is False
 
 
-# ── planner_node branch tests ─────────────────────────────────────────────────
+# ── _build_state_summary tests ────────────────────────────────────────────────
 
-class TestAwaiting:
-    """Priority-1 and priority-2 short circuits."""
+class TestBuildStateSummary:
+    def test_empty_state(self):
+        state = make_state(intent="claim")
+        summary = _build_state_summary(state)
+        assert "intent: claim" in summary
+        assert "user_claims_total: 0" in summary
+        assert "policy_chunks_available: 0" in summary
+        assert "image_available: False" in summary
 
+    def test_unassessed_claim_shown(self):
+        state = make_state(intent="claim", user_claims=[_unassessed_claim()])
+        summary = _build_state_summary(state)
+        assert "user_claims_unassessed: 1" in summary
+        assert "not assessed" in summary
+
+    def test_rejected_claim_shown(self):
+        state = make_state(intent="claim", user_claims=[_uncovered_claim()])
+        summary = _build_state_summary(state)
+        assert "verdict=rejected" in summary
+        assert "covered=False" in summary
+        assert "cosmetic damage excluded" in summary
+
+    def test_policy_chunks_counted(self):
+        state = make_state(policy_context=["chunk1", "chunk2", "chunk3"])
+        summary = _build_state_summary(state)
+        assert "policy_chunks_available: 3" in summary
+
+    def test_image_flag(self):
+        state = make_state(image_local_path="/tmp/img.jpg")
+        summary = _build_state_summary(state)
+        assert "image_available: True" in summary
+
+    def test_visual_checks_counted(self):
+        pending_check = {"check_description": "look for cracks", "finding": ""}
+        claim = _covered_claim(visual_checks=[pending_check])
+        state = make_state(user_claims=[claim])
+        summary = _build_state_summary(state)
+        assert "visual_checks=1" in summary
+        assert "claims_with_pending_visual_checks: 1" in summary
+
+    def test_covered_claims_awaiting_evidence_counted(self):
+        state = make_state(user_claims=[_covered_claim(visual_checks=[], claim_verdict=None)])
+        summary = _build_state_summary(state)
+        assert "covered_claims_awaiting_evidence_plan: 1" in summary
+
+    def test_covered_claim_with_verdict_not_counted_as_awaiting_evidence(self):
+        state = make_state(user_claims=[_covered_claim(visual_checks=[], claim_verdict="approved")])
+        summary = _build_state_summary(state)
+        assert "covered_claims_awaiting_evidence_plan: 0" in summary
+
+    def test_handles_missing_claim_fields_gracefully(self):
+        state = make_state(user_claims=[{"component": "device"}])
+        summary = _build_state_summary(state)
+        assert "device" in summary
+        assert "not assessed" in summary
+
+
+# ── Layer 1: Hard rules ───────────────────────────────────────────────────────
+
+class TestLayer1HardRules:
     def test_awaiting_feedback_routes_to_feedback_node(self):
-        state = make_state(awaiting_feedback=True)
-        result = planner_node(state)
+        result = planner_node(make_state(awaiting_feedback=True))
         assert result["next_node"] == "feedback_node"
 
-    def test_awaiting_feedback_takes_priority_over_switch_confirmation(self):
-        state = make_state(awaiting_feedback=True, pending_switch_confirmation=True)
-        result = planner_node(state)
+    def test_awaiting_feedback_beats_switch_confirmation(self):
+        result = planner_node(make_state(awaiting_feedback=True, pending_switch_confirmation=True))
         assert result["next_node"] == "feedback_node"
 
-    def test_pending_switch_confirmation_routes_to_confirmation_handler(self):
-        state = make_state(pending_switch_confirmation=True)
-        result = planner_node(state)
+    def test_awaiting_feedback_beats_post_resolution(self):
+        result = planner_node(make_state(awaiting_feedback=True, awaiting_post_resolution_followup=True))
+        assert result["next_node"] == "feedback_node"
+
+    def test_pending_switch_confirmation_routes_to_handler(self):
+        result = planner_node(make_state(pending_switch_confirmation=True))
         assert result["next_node"] == "confirmation_handler"
 
-    def test_pending_switch_confirmation_takes_priority_over_claim_state_intents(self):
-        state = make_state(
-            pending_switch_confirmation=True,
-            intent="claim",
-            claim_state_updated_this_turn=False,
-        )
-        result = planner_node(state)
+    def test_pending_switch_beats_post_resolution(self):
+        result = planner_node(make_state(pending_switch_confirmation=True, awaiting_post_resolution_followup=True))
         assert result["next_node"] == "confirmation_handler"
 
-
-class TestClaimStateUpdater:
-    """Intent-driven routing to claim_state_updater."""
-
-    @pytest.mark.parametrize("intent", ["claim", "issue", "evidence", "clarification", "policy"])
-    def test_claim_intents_route_to_updater(self, intent):
-        state = make_state(intent=intent, claim_state_updated_this_turn=False)
-        result = planner_node(state)
-        assert result["next_node"] == "claim_state_updater"
-
-    def test_frustration_with_text_routes_to_updater(self):
-        state = make_state(
-            intent="frustration",
-            messages=[{"role": "user", "content": "this charger is terrible"}],
-            claim_state_updated_this_turn=False,
-        )
-        result = planner_node(state)
-        assert result["next_node"] == "claim_state_updater"
-
-    def test_frustration_with_image_and_no_text_routes_to_updater(self):
-        state = make_state(
-            intent="frustration",
-            messages=[{"role": "user", "content": ""}],
-            image_local_path="/tmp/img.jpg",
-            claim_state_updated_this_turn=False,
-            user_claims=[],   # no claim memory → not image_only_followup
-            claim_items=[],
-        )
-        result = planner_node(state)
-        assert result["next_node"] == "claim_state_updater"
-
-    def test_already_updated_this_turn_skips_updater(self):
-        # claim intent but claim_state_updated_this_turn=True → falls through
-        state = make_state(
-            intent="claim",
-            claim_state_updated_this_turn=True,
-            user_claims=[_unassessed_claim()],
-        )
-        result = planner_node(state)
-        assert result["next_node"] == "policy_checker"
-
-    def test_image_only_followup_skips_updater(self):
-        """Image uploaded with no text and existing claim memory → skip to policy/evidence."""
-        claim = _covered_claim(visual_checks=[], claim_verdict=None)
-        state = make_state(
-            intent="claim",
-            claim_state_updated_this_turn=False,
-            messages=[{"role": "user", "content": ""}],  # no text
-            image_local_path="/tmp/damage.jpg",
-            user_claims=[claim],
-            claim_items=[{"component": "charger"}],
-        )
-        result = planner_node(state)
-        # Should NOT go to claim_state_updater; covered + no checks + image → evidence_planner
-        assert result["next_node"] == "evidence_planner"
-
-    def test_non_claim_intent_skips_updater(self):
-        state = make_state(intent="greeting", claim_state_updated_this_turn=False)
-        result = planner_node(state)
-        assert result["next_node"] == "greeting_node"
-
-
-class TestPostResolutionFollowup:
-    """Awaiting post-resolution followup branches."""
-
-    def test_negative_reply_routes_to_close_node(self):
-        state = make_state(
-            awaiting_post_resolution_followup=True,
-            intent="greeting",   # ensure not caught earlier
-            messages=[{"role": "user", "content": "no"}],
-            claim_state_updated_this_turn=True,  # skip updater branch
-        )
-        result = planner_node(state)
+    def test_awaiting_post_resolution_routes_to_close_node(self):
+        result = planner_node(make_state(awaiting_post_resolution_followup=True))
         assert result["next_node"] == "post_resolution_close_node"
 
-    @pytest.mark.parametrize("text", ["no", "nope", "nah", "nothing", "no thanks", "not now", "nothing else"])
-    def test_all_negative_markers_route_to_close(self, text):
-        state = make_state(
-            awaiting_post_resolution_followup=True,
-            messages=[{"role": "user", "content": text}],
-            claim_state_updated_this_turn=True,
-        )
-        result = planner_node(state)
+    def test_post_resolution_beats_simple_intent(self):
+        result = planner_node(make_state(awaiting_post_resolution_followup=True, intent="greeting"))
         assert result["next_node"] == "post_resolution_close_node"
 
-    def test_non_negative_reply_also_routes_to_close_node(self):
-        # Regardless of reply content, post-resolution always closes with feedback prompt.
-        state = make_state(
-            awaiting_post_resolution_followup=True,
-            messages=[{"role": "user", "content": "yes please help me"}],
-            claim_state_updated_this_turn=True,
-            intent="greeting",
-        )
-        result = planner_node(state)
-        assert result["next_node"] == "post_resolution_close_node"
+    def test_prompt_injection_routes_to_injection_node(self):
+        result = planner_node(make_state(intent="prompt_injection"))
+        assert result["next_node"] == "prompt_injection_node"
+
+    def test_layer1_does_not_call_llm(self):
+        with patch("agent.nodes.planner._llm_planner") as mock_llm:
+            planner_node(make_state(awaiting_feedback=True))
+            mock_llm.assert_not_called()
 
 
-class TestSimpleIntentRoutes:
-    """Direct terminal intent routing."""
+# ── Layer 2: Simple intent routes ─────────────────────────────────────────────
 
-    @pytest.mark.parametrize("intent,expected_node", [
-        ("prompt_injection", "prompt_injection_node"),
-        ("greeting",     "greeting_node"),
+class TestLayer2SimpleIntents:
+    @pytest.mark.parametrize("intent,expected", [
+        ("greeting", "greeting_node"),
         ("out_of_scope", "fallback_node"),
-        ("escalation",   "escalation_node"),
+        ("escalation", "escalation_node"),
         ("cancellation", "cancellation_node"),
         ("status_query", "status_node"),
     ])
-    def test_simple_intent_routes(self, intent, expected_node):
-        state = make_state(
-            intent=intent,
-            claim_state_updated_this_turn=True,  # skip updater
-        )
-        result = planner_node(state)
-        assert result["next_node"] == expected_node
+    def test_simple_intent_routes(self, intent, expected):
+        result = planner_node(make_state(intent=intent))
+        assert result["next_node"] == expected
+
+    def test_simple_intent_does_not_call_llm(self):
+        with patch("agent.nodes.planner._llm_planner") as mock_llm:
+            planner_node(make_state(intent="greeting"))
+            mock_llm.assert_not_called()
 
 
-class TestFrustrationWithoutPendingWork:
-    def test_frustration_no_unassessed_claims_routes_to_agent_respond(self):
-        # All claims are assessed → frustration goes directly to agent_respond
-        state = make_state(
-            intent="frustration",
-            claim_state_updated_this_turn=True,
-            user_claims=[_covered_claim(claim_verdict="rejected")],
-        )
-        result = planner_node(state)
-        assert result["next_node"] == "agent_respond"
+# ── Layer 3: LLM planner — real API calls ─────────────────────────────────────
 
+class TestLayer3LLMPlanner:
+    """
+    These tests make real LLM calls to verify the planner routes correctly
+    for each claim-flow scenario. No mocking of the LLM.
+    """
 
-class TestPolicyChecker:
     def test_unassessed_claim_routes_to_policy_checker(self):
         state = make_state(
             intent="claim",
-            claim_state_updated_this_turn=True,
+            messages=[{"role": "user", "content": "My charger stopped working suddenly."}],
             user_claims=[_unassessed_claim()],
         )
-        result = planner_node(state)
-        assert result["next_node"] == "policy_checker"
+        node, reason = _llm_planner(state)
+        assert node == "policy_checker", f"Expected policy_checker, got {node!r}. Reason: {reason}"
 
-    def test_mixed_assessed_unassessed_routes_to_policy_checker(self):
+    def test_new_claim_message_routes_to_claim_state_updater(self):
         state = make_state(
             intent="claim",
-            claim_state_updated_this_turn=True,
-            user_claims=[_covered_claim(claim_verdict="approved"), _unassessed_claim()],
+            messages=[{"role": "user", "content": "I have a cracked screen on my device."}],
+            user_claims=[],
         )
-        result = planner_node(state)
-        assert result["next_node"] == "policy_checker"
+        node, reason = _llm_planner(state)
+        assert node == "claim_state_updater", f"Expected claim_state_updater, got {node!r}. Reason: {reason}"
 
-
-class TestEvidencePlanner:
-    def test_covered_claim_no_checks_with_image_routes_to_evidence_planner(self):
+    def test_final_verdict_no_explanation_routes_to_agent_respond(self):
+        """Verdict set but agent hasn't explained why yet → agent_respond first."""
         state = make_state(
-            intent="claim",
-            claim_state_updated_this_turn=True,
-            image_local_path="/tmp/img.jpg",
+            intent="clarification",
+            messages=[
+                {"role": "user", "content": "I have scratches on my device."},
+            ],
+            user_claims=[_uncovered_claim()],
+            policy_context=["§3.1 Cosmetic damage is excluded from warranty coverage."],
+        )
+        node, reason = _llm_planner(state)
+        assert node == "agent_respond", f"Expected agent_respond, got {node!r}. Reason: {reason}"
+
+    def test_verdict_explained_in_conversation_routes_to_claim_decision(self):
+        """Agent has already explained the rejection → claim_decision next."""
+        state = make_state(
+            intent="clarification",
+            messages=[
+                {"role": "user", "content": "I have scratches on my device."},
+                {"role": "assistant", "content": "Unfortunately, cosmetic damage such as scratches is excluded from warranty coverage under §3.1. Since the damage does not affect device functionality, this claim is not covered."},
+                {"role": "user", "content": "Okay I understand."},
+            ],
+            user_claims=[_uncovered_claim()],
+            policy_context=["§3.1 Cosmetic damage is excluded from warranty coverage."],
+        )
+        node, reason = _llm_planner(state)
+        assert node == "claim_decision", f"Expected claim_decision, got {node!r}. Reason: {reason}"
+
+    def test_covered_claim_with_image_routes_to_evidence_planner(self):
+        state = make_state(
+            intent="evidence",
+            messages=[{"role": "user", "content": "Here is the photo of the damaged charger."}],
+            image_local_path="/tmp/damage.jpg",
             user_claims=[_covered_claim(visual_checks=[])],
         )
-        result = planner_node(state)
-        assert result["next_node"] == "evidence_planner"
+        node, reason = _llm_planner(state)
+        assert node == "evidence_planner", f"Expected evidence_planner, got {node!r}. Reason: {reason}"
 
-    def test_no_image_does_not_route_to_evidence_planner(self):
-        state = make_state(
-            intent="claim",
-            claim_state_updated_this_turn=True,
-            image_local_path=None,
-            user_claims=[_covered_claim(visual_checks=[])],
-        )
-        result = planner_node(state)
-        assert result["next_node"] != "evidence_planner"
-
-
-class TestVisionAnalysis:
-    def test_covered_claim_with_pending_checks_and_image_routes_to_vision(self):
+    def test_visual_checks_with_image_routes_to_vision_analysis(self):
         pending_check = {
-            "check_description": "look for burn marks",
-            "expected_finding": "visible burn marks",
-            "finding": "",   # unevaluated
+            "check_description": "Look for burn marks on the cable",
+            "expected_finding": "visible burn or scorch marks",
+            "finding": "",
         }
         state = make_state(
-            intent="claim",
-            claim_state_updated_this_turn=True,
+            intent="evidence",
+            messages=[{"role": "user", "content": "Here is the photo."}],
             image_local_path="/tmp/damage.jpg",
             user_claims=[_covered_claim(visual_checks=[pending_check])],
         )
-        result = planner_node(state)
-        assert result["next_node"] == "vision_analysis"
+        node, reason = _llm_planner(state)
+        assert node == "vision_analysis", f"Expected vision_analysis, got {node!r}. Reason: {reason}"
 
-    def test_completed_checks_do_not_route_to_vision(self):
-        completed_check = {
-            "check_description": "look for burn marks",
-            "expected_finding": "visible burn marks",
-            "finding": "burn marks found",
-        }
+    def test_frustration_with_no_claims_routes_to_agent_respond(self):
         state = make_state(
-            intent="claim",
-            claim_state_updated_this_turn=True,
-            image_local_path="/tmp/damage.jpg",
-            user_claims=[_covered_claim(visual_checks=[completed_check], claim_verdict="approved")],
-            policy_clauses=["clause-1"],
-        )
-        result = planner_node(state)
-        assert result["next_node"] == "claim_decision"
-
-
-class TestClaimDecision:
-    def test_final_verdicts_with_grounding_routes_to_claim_decision(self):
-        state = make_state(
-            intent="claim",
-            claim_state_updated_this_turn=True,
-            user_claims=[_covered_claim(claim_verdict="approved")],
-            policy_clauses=["section-4.2"],
-        )
-        result = planner_node(state)
-        assert result["next_node"] == "claim_decision"
-
-    def test_final_verdicts_grounded_via_policy_context(self):
-        state = make_state(
-            intent="claim",
-            claim_state_updated_this_turn=True,
-            user_claims=[_uncovered_claim()],
-            policy_context=["The warranty excludes cosmetic damage."],
-            policy_clauses=[],
-        )
-        result = planner_node(state)
-        assert result["next_node"] == "claim_decision"
-
-    def test_final_verdicts_grounded_via_claim_clauses(self):
-        covered = _covered_claim(
-            claim_verdict="approved",
-            policy_coverage={"covered": True, "policy_clauses": ["clause-7"]},
-        )
-        state = make_state(
-            intent="claim",
-            claim_state_updated_this_turn=True,
-            user_claims=[covered],
-            policy_clauses=[],
-            policy_context=[],
-        )
-        result = planner_node(state)
-        assert result["next_node"] == "claim_decision"
-
-    def test_final_verdicts_without_grounding_routes_to_agent_respond(self):
-        state = make_state(
-            intent="claim",
-            claim_state_updated_this_turn=True,
-            user_claims=[_covered_claim(
-                claim_verdict="approved",
-                policy_coverage={"covered": True, "policy_clauses": []},
-            )],
-            policy_clauses=[],
-            policy_context=[],
-        )
-        result = planner_node(state)
-        assert result["next_node"] == "agent_respond"
-        assert "no retrieved policy grounding" in result["planner_reason"]
-
-
-class TestAgentRespond:
-    def test_no_claims_routes_to_agent_respond(self):
-        state = make_state(
-            intent="claim",
-            claim_state_updated_this_turn=True,
+            intent="frustration",
+            messages=[{"role": "user", "content": "This is completely unacceptable!"}],
             user_claims=[],
         )
-        result = planner_node(state)
-        assert result["next_node"] == "agent_respond"
+        node, reason = _llm_planner(state)
+        assert node == "agent_respond", f"Expected agent_respond, got {node!r}. Reason: {reason}"
 
-    def test_all_assessed_no_final_verdicts_routes_to_agent_respond(self):
-        # covered but claim_verdict is still None (pending validation)
+    def test_output_is_always_a_valid_node(self):
+        """LLM must always return a node in the allowed set."""
         state = make_state(
-            intent="claim",
-            claim_state_updated_this_turn=True,
-            user_claims=[_covered_claim(claim_verdict=None, visual_checks=[])],
-            image_local_path=None,
+            intent="policy",
+            messages=[{"role": "user", "content": "What does the warranty cover?"}],
         )
-        result = planner_node(state)
-        assert result["next_node"] == "agent_respond"
-        assert "More information" in result["planner_reason"]
+        node, reason = _llm_planner(state)
+        assert node in _VALID_LLM_NODES, f"Got invalid node {node!r}"
+        assert isinstance(reason, str) and reason
 
+
+# ── LLM fallback on bad output ────────────────────────────────────────────────
+
+class TestLLMFallback:
+    """Error handling when the LLM returns unusable output. fast_llm is mocked
+    because we need to simulate garbage responses that a real LLM won't produce."""
+
+    def test_invalid_node_name_falls_back_to_agent_respond(self):
+        with patch("agent.nodes.planner.fast_llm", return_value='{"next_node": "nonexistent_node", "reason": "bad"}'):
+            node, reason = _llm_planner(make_state(intent="claim"))
+            assert node == "agent_respond"
+            assert "Fallback" in reason
+
+    def test_malformed_json_falls_back_to_agent_respond(self):
+        with patch("agent.nodes.planner.fast_llm", return_value="not valid json at all"):
+            node, reason = _llm_planner(make_state(intent="claim"))
+            assert node == "agent_respond"
+            assert "Fallback" in reason
+
+    def test_empty_response_falls_back_to_agent_respond(self):
+        with patch("agent.nodes.planner.fast_llm", return_value=""):
+            node, reason = _llm_planner(make_state(intent="claim"))
+            assert node == "agent_respond"
+            assert "Fallback" in reason
+
+
+# ── Return shape ──────────────────────────────────────────────────────────────
 
 class TestReturnShape:
-    """Ensure planner_node always returns the required keys."""
+    REQUIRED_KEYS = {"execution_plan", "next_node", "planner_reason"}
 
-    REQUIRED_KEYS = {"execution_plan", "next_node", "planner_reason", "claim_state_updated_this_turn"}
-
-    @pytest.mark.parametrize("intent", [
-        "greeting", "claim", "escalation", "frustration", "out_of_scope", "prompt_injection",
-    ])
-    def test_return_contains_required_keys(self, intent):
-        state = make_state(intent=intent)
-        result = planner_node(state)
+    @pytest.mark.parametrize("intent", ["greeting", "escalation", "out_of_scope", "prompt_injection"])
+    def test_deterministic_intents_have_required_keys(self, intent):
+        result = planner_node(make_state(intent=intent))
         for key in self.REQUIRED_KEYS:
             assert key in result, f"Missing key: {key}"
 
     def test_execution_plan_is_list(self):
-        result = planner_node(make_state())
+        result = planner_node(make_state(intent="greeting"))
         assert isinstance(result["execution_plan"], list)
 
-    def test_next_node_is_string(self):
-        result = planner_node(make_state())
+    def test_next_node_is_non_empty_string(self):
+        result = planner_node(make_state(intent="greeting"))
         assert isinstance(result["next_node"], str)
         assert result["next_node"] != ""

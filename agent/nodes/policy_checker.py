@@ -6,19 +6,34 @@ from __future__ import annotations
 from agent.services.coverage_service import assess_coverage, reformulate_queries
 from agent.tools.retrieval_tool import retrieve_policy_chunks
 from models.state import AgentState
+from observability.tracing import start_span
 
 
-def _retrieve_deduped_chunks(queries: list[str]) -> list[dict]:
-    seen_texts: set[str] = set()
-    chunks: list[dict] = []
-    for query in queries:
-        for chunk in retrieve_policy_chunks(query):
-            if chunk["text"] in seen_texts:
-                continue
-            seen_texts.add(chunk["text"])
-            chunks.append(chunk)
-    chunks.sort(key=lambda item: item["score"], reverse=True)
-    return chunks[:5]
+def _retrieve_deduped_chunks(queries: list[str], component: str = "") -> list[dict]:
+    with start_span(
+        "rag.retrieve_for_claim",
+        {
+            "claim.component": component,
+            "rag.query_count": len(queries),
+            "rag.queries": queries,
+        },
+    ) as span:
+        seen_texts: set[str] = set()
+        chunks: list[dict] = []
+        for query in queries:
+            for chunk in retrieve_policy_chunks(query):
+                if chunk["text"] in seen_texts:
+                    continue
+                seen_texts.add(chunk["text"])
+                chunks.append(chunk)
+        chunks.sort(key=lambda item: item["score"], reverse=True)
+        result = chunks[:5]
+        span.set_attribute("rag.deduped_chunk_count", len(result))
+        span.set_attribute(
+            "rag.final_chunks",
+            [{"section": c["section"], "score": c["score"]} for c in result],
+        )
+        return result
 
 
 # ── Main node ─────────────────────────────────────────────────────────────────
@@ -35,7 +50,7 @@ def policy_checker_node(state: AgentState) -> dict:
         )
         if last_user:
             queries = reformulate_queries("policy inquiry", last_user)
-            all_chunks = _retrieve_deduped_chunks(queries)
+            all_chunks = _retrieve_deduped_chunks(queries, component="policy inquiry")
         return {
             "user_claims": user_claims,
             "policy_context": [c["text"] for c in all_chunks],
@@ -51,7 +66,7 @@ def policy_checker_node(state: AgentState) -> dict:
         statement = claim.get("verbatim_statement", "") or component
 
         queries = reformulate_queries(component, statement)
-        chunks = _retrieve_deduped_chunks(queries)
+        chunks = _retrieve_deduped_chunks(queries, component=component)
         all_chunks.extend(chunks)
 
         coverage = assess_coverage(component, statement, chunks)

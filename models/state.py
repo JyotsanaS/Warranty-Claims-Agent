@@ -97,7 +97,6 @@ class AgentState(TypedDict):
     user_claims: list[dict]        # list of UserClaim serialised as dicts
     pending_claim_draft: Optional[dict]
     awaiting_post_resolution_followup: bool
-    claim_state_updated_this_turn: bool
 
     # Router signals
     intent: str
