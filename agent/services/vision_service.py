@@ -4,10 +4,14 @@ Vision processing service for claim image analysis.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import mimetypes
 from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageFilter
 
 from agent.prompt_store import get_prompt
 from gateway.llm_gateway import vision_llm
@@ -42,6 +46,38 @@ def _detect_mime_type(image_path: str, raw_bytes: bytes) -> str:
     }.get(suffix, "application/octet-stream")
 
 
+_MIN_DIMENSION_PX = 100       # both width and height must meet this
+_BLUR_VARIANCE_THRESHOLD = 80  # Laplacian variance below this → too blurry
+
+
+def _check_image_quality(raw_bytes: bytes) -> str | None:
+    """
+    Returns a rejection_reason string if the image fails quality checks,
+    or None if the image is acceptable.
+    Checks: minimum pixel dimensions and blurriness (Laplacian variance).
+    """
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        w, h = img.size
+        if w < _MIN_DIMENSION_PX or h < _MIN_DIMENSION_PX:
+            return f"image_too_small (got {w}x{h}, minimum {_MIN_DIMENSION_PX}x{_MIN_DIMENSION_PX})"
+
+        gray = img.convert("L")
+        laplacian = gray.filter(ImageFilter.Kernel(
+            size=3,
+            kernel=[0, 1, 0, 1, -4, 1, 0, 1, 0],
+            scale=1,
+            offset=128,
+        ))
+        variance = float(np.array(laplacian).var())
+        if variance < _BLUR_VARIANCE_THRESHOLD:
+            return f"image_too_blurry (variance={variance:.1f}, threshold={_BLUR_VARIANCE_THRESHOLD})"
+    except Exception as exc:
+        logger.warning("Image quality check failed to run: %s", exc)
+
+    return None
+
+
 def analyze_image(image_path: str, checks: list[dict]) -> dict:
     with start_span(
         "vision.analyze_image",
@@ -67,6 +103,15 @@ def analyze_image(image_path: str, checks: list[dict]) -> dict:
             logger.error("Vision: failed to read image %s: %s", image_path, exc)
             return {
                 "damage_report": {"error": str(exc)},
+                "checks": [],
+            }
+
+        rejection_reason = _check_image_quality(raw_bytes)
+        if rejection_reason:
+            logger.warning("Vision: image quality gate rejected %s — %s", image_path, rejection_reason)
+            span.set_attribute("vision.quality_rejection", rejection_reason)
+            return {
+                "damage_report": {"image_quality": "poor", "rejection_reason": rejection_reason},
                 "checks": [],
             }
 
