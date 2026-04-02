@@ -115,5 +115,8 @@ class AgentState(TypedDict):
     awaiting_feedback: bool
     user_feedback: Optional[str]     # "like" | "dislike" | None
 
+    # Session control
+    terminate_session: bool
+
     # Token budget
     token_count: int

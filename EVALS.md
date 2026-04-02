@@ -209,7 +209,7 @@ A production-grade agent needs two kinds of observability: system telemetry and 
 - escalation rate
 - manual-review rate
 
-This repo already has the right shape for that. [`observability/tracing.py`](/home/antpc/Desktop/chargepoint/observability/tracing.py) and the streamed node traces in the agent flow are enough to support per-turn auditing, which is the minimum viable observability story for a system like this.
+This repo has the beginning of that foundation through [`observability/tracing.py`](/home/antpc/Desktop/chargepoint/observability/tracing.py) and streamed node traces in the agent flow, but the instrumentation is not complete yet. In particular, I would still want richer capture of retrieval details, selected chunks, intermediate planner decisions, guardrail outcomes, and the exact evidence used to reach a final claim decision.
 
 ## Drift Strategy
 
@@ -281,4 +281,4 @@ The fastest path from prototype to credible evaluation would be:
 4. score them for verdict correctness, grounding, latency, and cost
 5. require human review for approvals and ambiguous failures
 
-That would be enough to turn this from a demo with tests into an agent with a release discipline.
+Those checks should be added to the CI/CD pipeline so prompt, model, retrieval, and workflow changes are evaluated before release rather than after production drift is observed.

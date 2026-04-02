@@ -1,11 +1,88 @@
-# Agent Architecture — VoltEdge Warranty Claims
+# Architecture — VoltEdge Warranty Claims
 
-## Overview
+## System Architecture
+
+VoltEdge is implemented as a small, modular application with clear runtime boundaries between the API layer, agent runtime, model gateway, retrieval layer, and persistence layer.
+
+### High-Level Components
+
+| Component | Responsibility |
+|---|---|
+| **Streamlit UI** | Chat interface for session creation, message submission, image upload, and rendering streamed agent output. |
+| **FastAPI app** | Public application boundary. Validates requests, manages sessions, accepts optional image uploads, and streams agent events back over SSE. |
+| **LangGraph agent runtime** | Executes the claim workflow as a stateful graph over a typed `AgentState`. Owns orchestration, routing, and decision flow. |
+| **LLM gateway** | Centralizes text, vision, and embedding model access in `gateway/llm_gateway.py` so provider-specific code stays out of business logic. |
+| **RAG layer** | Retrieves grounded warranty-policy context from Pinecone using locally generated embeddings. |
+| **Storage layer** | Persists uploaded images and per-session JSON artifacts under `RESULTS_DIR`; keeps active session state in memory for the current process. |
+| **Observability** | Wraps API, LLM, RAG, and graph execution with OpenTelemetry spans and persists serialized traces with session artifacts. |
+
+### Runtime Flow
+
+1. The Streamlit client creates a session through FastAPI and sends each turn as text with an optional image.
+2. FastAPI stores uploaded images on the local filesystem, appends the user message to the in-memory session record, and opens an SSE stream.
+3. The LangGraph runner executes the agent graph for that turn and emits structured events such as node traces, tool activity, text deltas, and claim decisions.
+4. Agent nodes call the LLM gateway for text or vision reasoning and call the RAG layer when policy grounding is required.
+5. At the end of the turn, the backend persists the updated conversation, claim state, and trace artifacts under the session directory.
+
+### Backend and Session Management
+
+- The FastAPI service acts as the application boundary for the system. It owns request validation, multipart image intake, SSE response streaming, and session lifecycle endpoints.
+- Sessions are explicitly created through `POST /api/v1/sessions` and keyed by `session_id`, which gives the agent a stable unit of state across turns.
+- Active session state is maintained in memory and includes message history, claim status, structured claim state, active-claim pointer, and flow-control flags such as first-turn and post-resolution follow-up handling.
+- The message endpoint is stateful at the application layer: it merges the current turn with prior session context, invokes the graph, then writes the updated agent state back into the session record after streaming completes.
+- Idle session eviction is implemented as a background task. Sessions with no activity for the configured timeout are removed from the in-memory store to bound process memory and keep stale conversational state from accumulating.
+- API rate limiting is intentionally simple in the current design: a per-session request cap of **15 turns per 5 minutes** on the message endpoint protects the expensive agent path without adding distributed infrastructure.
+- In production, this would be extended into a two-layer control model: **edge rate limiting** for per-IP, per-user, and account-level quotas, and **backend throttling** to cap concurrent agent and vision workloads so burst traffic cannot exhaust the application tier.
+- The current limiter is process-local and in-memory; a production deployment would move these controls to a shared store such as **Redis** or **Memcached** so limits remain consistent across multiple application instances.
+- Each completed turn is persisted as a session artifact under `RESULTS_DIR/<session_id>/`, including conversation history, structured claim data, latest trace summary, and serialized OpenTelemetry trace output.
+- Image uploads are validated before entering the agent flow and are stored under the per-session artifact directory so claim evidence stays tied to the corresponding conversation state.
+
+### Architectural Notes
+
+- The backend is the single integration boundary for the frontend; the UI does not call the agent, vector store, or model providers directly.
+- The graph owns business flow, while transport concerns such as HTTP, multipart upload handling, and SSE remain in the API layer.
+- Retrieval and model access are isolated behind dedicated modules, which keeps node logic focused on claim handling rather than infrastructure details.
+- The current implementation is intentionally simple in its state model: active sessions are process-local, while durable artifacts are written to disk per session.
+
+## Scale to >1M Users
+
+At that scale, the core agent design can remain the same, but the runtime architecture must move from a single-process prototype model to a distributed service model with externalized state and explicit workload control.
+
+### Required Changes
+
+| Area | Production design direction |
+|---|---|
+| **API tier** | Run multiple stateless FastAPI instances behind a load balancer. Keep the API layer responsible for request validation, auth, and SSE/WebSocket delivery, but remove all process-local assumptions. |
+| **Session state** | Move active session state out of in-memory Python dictionaries into a shared session store such as Redis or a database-backed state service so any app instance can resume a conversation safely. |
+| **Rate limiting and throttling** | Enforce per-IP, per-user, and per-account quotas at the edge, backed by Redis or Memcached. Apply backend throttling for concurrent agent turns and vision-heavy workloads to protect the expensive path. |
+| **Async claim execution** | For long-running turns, decouple claim execution from the request thread using a job queue and worker pool. The API tier becomes the ingress layer; agent workers handle graph execution. |
+| **Artifact and image storage** | Replace local filesystem storage with object storage for uploaded images and session artifacts so files remain durable and accessible across instances. |
+| **RAG infrastructure** | Keep retrieval as a separate service boundary around the vector index and embedding pipeline, with policy re-indexing handled asynchronously rather than inside the request path. |
+| **Observability and operations** | Export traces, logs, and usage metrics to centralized observability systems; operational decisions at this scale require system-wide visibility rather than per-node local logs. |
+
+### Design Principle
+
+The main architectural shift is to make the **API tier stateless**, the **agent runtime horizontally scalable**, and all coordination concerns such as session state, quotas, artifacts, and background work owned by shared infrastructure instead of individual application processes.
+
+### Prototype -> Production Migration
+
+1. **Stateless API tier**: Replace process-local assumptions with multiple FastAPI instances behind a load balancer.
+2. **Externalized session state**: Move active session and flow-control state from in-memory Python dictionaries to Redis or another shared session store.
+3. **Persistent system of record**: Store conversations, structured claim state, verdicts, citations, feedback, and trace metadata in a database, while keeping large artifacts such as images in object storage.
+4. **Edge rate limiting and backend throttling**: Enforce per-IP, per-user, and account-level quotas at the edge, and cap concurrent agent and vision workloads in the backend.
+5. **Async execution model**: Move long-running or multimodal claim execution to queues and worker pools so request handling and agent execution can scale independently.
+6. **Auditability and versioning**: Version policy corpus, prompts, model configuration, and decision logic so every claim outcome is reproducible and reviewable.
+7. **Feedback and drift monitoring**: Capture user feedback and downstream outcomes, and continuously compare production behavior against offline benchmark suites to detect quality regressions.
+8. **Graceful degradation**: When retrieval, vision, or model providers are degraded, fall back to pending or manual-review flows instead of failing the claim path outright.
+
+## Agent Design
+
+### Overview
 A **LangGraph-based stateful agent** for processing EV charger warranty claims. Uses a `StateGraph` with a central planner orchestrating specialized nodes.
 
 ---
 
-## Graph Topology
+### Graph Topology
 
 ```
 START → router → planner → [conditional routing]
@@ -24,7 +101,7 @@ START → router → planner → [conditional routing]
 
 ---
 
-## Node Responsibilities
+### Node Responsibilities
 
 | Node | Role |
 |---|---|
@@ -43,7 +120,7 @@ START → router → planner → [conditional routing]
 
 ---
 
-## State (`AgentState`)
+### State (`AgentState`)
 Key fields:
 - `messages` — full conversation history
 - `claim_items` — `ClaimContext` list (structured session data)
@@ -57,7 +134,7 @@ Key fields:
 
 ---
 
-## Router → Planner: Intent-Driven Routing
+### Router → Planner: Intent-Driven Routing
 
 The agent uses a two-stage dispatch model where **router identifies intent** and **planner acts on it**.
 
@@ -79,7 +156,7 @@ This separation is intentional: the router answers **"what does the user want?"*
 
 ---
 
-## Key Design Patterns
+### Key Design Patterns
 1. **Two-stage dispatch** — router classifies intent via LLM; planner translates intent + full state into an execution decision via pure logic (no LLM)
 2. **Planner is the brain** — all routing decisions after the initial router live in `planner_node`
 3. **Loop-back pattern** — most nodes return to planner after completing, enabling multi-step pipelines in one turn
@@ -89,11 +166,15 @@ This separation is intentional: the router answers **"what does the user want?"*
 
 ---
 
-## Guardrails
+### Guardrails
 
 Framework: **[Guardrails AI](https://guardrailsai.com/)** — `GroundedAIHallucination` validator, backed by `fast_llm`.
 
-### Policy Hallucination Detection
+#### Prompt Injection Detection
+
+Prompt injection is handled as a separate router-level guardrail, especially on turns that can update claim state or influence policy reasoning. If the detector sees attempts to override policy, manipulate session state, or force an unsupported decision, the agent responds with a safe refusal such as: *"Sorry, we believe this request is attempting to manipulate policy or claim handling. We are closing this session for now."* The session is then terminated instead of continuing through the claim workflow.
+
+#### Policy Hallucination Detection
 
 LLM calls that reason over retrieved policy chunks can fabricate clause names or coverage rationale not present in the source text. A hallucinated approval is a direct business and legal risk.
 
@@ -106,6 +187,6 @@ The validator checks whether LLM output (`value`) is grounded in the retrieved p
 
 **Fail-open:** If the validator itself errors, the check is skipped and a warning is emitted to the trace. The claim flow is never blocked by a guardrail failure.
 
-### Image Quality Gate
+#### Image Quality Gate
 
 Applied in `vision_service.analyze_image` before the multimodal LLM call. Checks pixel dimensions (PIL) and blurriness (Laplacian variance). On failure, returns `checks=[]` — `claim_validator` sees unevaluated checks, sets `verdict=pending`, and the agent asks the user to re-upload.

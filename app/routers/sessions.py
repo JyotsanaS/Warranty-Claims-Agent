@@ -28,6 +28,8 @@ router = APIRouter()
 # In-memory store: session_id → session dict
 _sessions: dict[str, dict] = {}
 IDLE_TIMEOUT_SECONDS = 180
+SESSION_TURN_LIMIT = 15
+SESSION_TURN_WINDOW_SECONDS = 5 * 60
 INITIAL_ASSISTANT_MESSAGE = (
     "Welcome to VoltEdge warranty support. I can help with warranty claims, "
     "coverage questions, and claim status updates. Tell me what issue you're "
@@ -40,6 +42,37 @@ def _require_session(session_id: str) -> dict:
     if session_id not in _sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     return _sessions[session_id]
+
+
+def _enforce_message_rate_limit(session: dict, now: float | None = None) -> None:
+    now = time.time() if now is None else now
+
+    if session.get("active_request"):
+        raise HTTPException(
+            status_code=429,
+            detail="A turn is already in progress for this session",
+        )
+
+    timestamps = [
+        ts for ts in session.get("request_timestamps", [])
+        if now - ts < SESSION_TURN_WINDOW_SECONDS
+    ]
+    if len(timestamps) >= SESSION_TURN_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Session rate limit exceeded: max {SESSION_TURN_LIMIT} turns "
+                f"per {SESSION_TURN_WINDOW_SECONDS // 60} minutes"
+            ),
+        )
+
+    timestamps.append(now)
+    session["request_timestamps"] = timestamps
+    session["active_request"] = True
+
+
+def _release_active_request(session: dict) -> None:
+    session["active_request"] = False
 
 
 def _persist_session_artifacts(
@@ -109,6 +142,8 @@ async def create_session():
         "awaiting_first_user_turn": True,
         "created_at": datetime.utcnow().isoformat(),
         "last_activity_at": time.time(),
+        "request_timestamps": [],
+        "active_request": False,
     }
     logger.info("Created session %s", session_id)
     return {
@@ -134,6 +169,7 @@ async def send_message(
     """
     session = _require_session(session_id)
     session["last_activity_at"] = time.time()
+    _enforce_message_rate_limit(session)
 
     # ── Image validation & storage ────────────────────────────────────────────
     image_path: str | None = None
@@ -182,55 +218,58 @@ async def send_message(
             awaiting_first_user_turn=session.get("awaiting_first_user_turn", False),
         )
 
-        for chunk in gen:
-            if chunk.startswith("data: "):
-                try:
-                    evt = json.loads(chunk[6:].strip())
-                    etype = evt.get("event") or evt.get("type")
-                    if etype == "text_delta":
-                        accumulated_tokens.append(evt["data"].get("token", ""))
-                    elif etype == "claim_decision":
-                        session["claim_status"] = evt["data"].get("status")
-                    elif etype == "done":
-                        last_trace = evt["data"].get("trace", [])
-                        last_trace_total_ms = evt["data"].get("total_ms")
-                except (json.JSONDecodeError, KeyError):
-                    pass
-            yield chunk
+        try:
+            for chunk in gen:
+                if chunk.startswith("data: "):
+                    try:
+                        evt = json.loads(chunk[6:].strip())
+                        etype = evt.get("event") or evt.get("type")
+                        if etype == "text_delta":
+                            accumulated_tokens.append(evt["data"].get("token", ""))
+                        elif etype == "claim_decision":
+                            session["claim_status"] = evt["data"].get("status")
+                        elif etype == "done":
+                            last_trace = evt["data"].get("trace", [])
+                            last_trace_total_ms = evt["data"].get("total_ms")
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+                yield chunk
 
-        # ── Persist updated agent state back into session ─────────────────────
-        final = pop_final_state(session_id)
-        if final.get("claim_items") is not None:
-            session["claim_items"] = final["claim_items"]
-        if final.get("user_claims") is not None:
-            session["user_claims"] = final["user_claims"]
-        if "pending_claim_draft" in final:
-            session["pending_claim_draft"] = final.get("pending_claim_draft")
-        if "awaiting_post_resolution_followup" in final:
-            session["awaiting_post_resolution_followup"] = final.get(
-                "awaiting_post_resolution_followup", False
+            # ── Persist updated agent state back into session ─────────────────
+            final = pop_final_state(session_id)
+            if final.get("claim_items") is not None:
+                session["claim_items"] = final["claim_items"]
+            if final.get("user_claims") is not None:
+                session["user_claims"] = final["user_claims"]
+            if "pending_claim_draft" in final:
+                session["pending_claim_draft"] = final.get("pending_claim_draft")
+            if "awaiting_post_resolution_followup" in final:
+                session["awaiting_post_resolution_followup"] = final.get(
+                    "awaiting_post_resolution_followup", False
+                )
+            if final.get("active_claim_index") is not None:
+                session["active_claim_index"] = final["active_claim_index"]
+            if final.get("_openinference_trace_id") is not None:
+                openinference_trace_id = final["_openinference_trace_id"]
+            if final.get("_openinference_trace") is not None:
+                openinference_trace = final["_openinference_trace"]
+            session["awaiting_first_user_turn"] = False
+
+            # Save assistant reply to conversation history
+            full_response = "".join(accumulated_tokens)
+            if full_response:
+                session["messages"].append({"role": "assistant", "content": full_response})
+
+            _persist_session_artifacts(
+                session,
+                image_path,
+                last_trace,
+                last_trace_total_ms,
+                openinference_trace_id,
+                openinference_trace,
             )
-        if final.get("active_claim_index") is not None:
-            session["active_claim_index"] = final["active_claim_index"]
-        if final.get("_openinference_trace_id") is not None:
-            openinference_trace_id = final["_openinference_trace_id"]
-        if final.get("_openinference_trace") is not None:
-            openinference_trace = final["_openinference_trace"]
-        session["awaiting_first_user_turn"] = False
-
-        # Save assistant reply to conversation history
-        full_response = "".join(accumulated_tokens)
-        if full_response:
-            session["messages"].append({"role": "assistant", "content": full_response})
-
-        _persist_session_artifacts(
-            session,
-            image_path,
-            last_trace,
-            last_trace_total_ms,
-            openinference_trace_id,
-            openinference_trace,
-        )
+        finally:
+            _release_active_request(session)
 
     return StreamingResponse(
         _event_stream(),
